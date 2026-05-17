@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DS-300 Emulator</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0d1117; color: #c9d1d9;
+    min-height: 100vh; padding: 1.5rem;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; color: #e6edf3; letter-spacing: .05em; }
+  .header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }
+  .badge {
+    background: #21262d; border: 1px solid #30363d;
+    border-radius: 6px; padding: .25rem .6rem; font-size: .75rem;
+    font-weight: 700; color: #8b949e; letter-spacing: .08em;
+  }
+
+  /* ── Port section ── */
+  .card {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .card-title { font-size: .7rem; font-weight: 700; color: #8b949e;
+    text-transform: uppercase; letter-spacing: .08em; margin-bottom: .75rem; }
+
+  .port-row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  input[type=text], select {
+    background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+    border-radius: 6px; padding: .4rem .75rem; font-size: .85rem;
+    outline: none;
+  }
+  input[type=text]:focus, select:focus { border-color: #58a6ff; }
+  input[type=text] { width: 200px; }
+
+  .btn {
+    padding: .4rem .9rem; border-radius: 6px; border: none;
+    font-size: .85rem; font-weight: 600; cursor: pointer; transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn:disabled { opacity: .35; cursor: not-allowed; }
+  .btn--primary  { background: #238636; color: #fff; }
+  .btn--danger   { background: #b91c1c; color: #fff; }
+  .btn--ghost    { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .btn--go       { background: #16a34a; color: #fff; font-size: 1.1rem;
+                   padding: .6rem 2rem; border-radius: 8px; min-width: 120px; }
+  .btn--pause    { background: #ca8a04; color: #fff; font-size: 1rem;
+                   padding: .6rem 1.5rem; border-radius: 8px; }
+  .btn--stop     { background: #b91c1c; color: #fff; font-size: 1rem;
+                   padding: .6rem 1.5rem; border-radius: 8px; }
+
+  .conn-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #30363d; display: inline-block; margin-right: .4rem;
+  }
+  .conn-dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+
+  /* ── Race controls ── */
+  .controls { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+
+  /* ── Timer ── */
+  .timer-block { text-align: center; }
+  .timer {
+    font-family: 'Courier New', monospace; font-size: 3rem; font-weight: 700;
+    color: #f6c90e; letter-spacing: .1em; line-height: 1;
+  }
+  .timer.paused  { color: #ca8a04; }
+  .timer.finished { color: #e63946; }
+  .timer.idle     { color: #30363d; }
+  .state-label {
+    font-size: .7rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .1em; margin-top: .25rem;
+  }
+  .state-label.running  { color: #3fb950; }
+  .state-label.paused   { color: #ca8a04; }
+  .state-label.finished { color: #e63946; }
+  .state-label.idle     { color: #30363d; }
+
+  /* ── Lane grid ── */
+  .lanes-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: .75rem;
+    margin-bottom: 1rem;
+  }
+  @media (max-width: 700px) { .lanes-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .lane-card {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 8px; padding: .75rem;
+    border-top: 3px solid var(--lane-color, #30363d);
+  }
+  .lane-card__header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: .5rem;
+  }
+  .lane-num {
+    background: var(--lane-color, #30363d);
+    color: #fff; border-radius: 50%; width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .75rem; font-weight: 700;
+  }
+  .lane-laps { font-size: 1.6rem; font-weight: 700; color: #f6c90e; text-align: center; }
+  .lane-last { font-family: 'Courier New', monospace; font-size: .75rem; color: #58a6ff; text-align: center; }
+  .lane-avg-row { display: flex; align-items: center; gap: .35rem; margin-top: .4rem; }
+  .lane-avg-label { font-size: .65rem; color: #8b949e; }
+  .lane-avg-input {
+    background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+    border-radius: 4px; padding: .15rem .35rem; font-size: .7rem; width: 55px;
+  }
+
+  /* ── Log ── */
+  .log {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: .75rem; height: 140px; overflow-y: auto; font-family: 'Courier New', monospace;
+    font-size: .75rem; color: #8b949e;
+  }
+  .log p { margin: .1rem 0; }
+  .log p.info  { color: #3fb950; }
+  .log p.warn  { color: #ca8a04; }
+  .log p.error { color: #e63946; }
+
+  /* ── Help ── */
+  .help { font-size: .75rem; color: #6e7681; line-height: 1.6; }
+  .help code {
+    background: #21262d; border: 1px solid #30363d; padding: .1rem .4rem;
+    border-radius: 4px; font-size: .72rem; color: #58a6ff;
+  }
+
+  .row { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
+  .grow { flex: 1 1 auto; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>DS-300 Emulator</h1>
+  <span class="badge">56000 BAUD · 8 CARRILES · 5 MIN</span>
+  <span id="connBadge" class="badge"><span class="conn-dot" id="connDot"></span>Desconectado</span>
+</div>
+
+<!-- Port -->
+<div class="card">
+  <div class="card-title">Puerto Serie</div>
+  <div class="port-row">
+    <select id="portSelect"><option value="">-- seleccionar --</option></select>
+    <input type="text" id="portInput" placeholder="/dev/ttys001 o COM3">
+    <input type="text" id="baudInput" value="56000" style="width:80px">
+    <button class="btn btn--primary" id="btnConnect">Conectar</button>
+    <button class="btn btn--ghost"   id="btnDisconnect" disabled>Desconectar</button>
+    <button class="btn btn--ghost"   id="btnRefresh">↺</button>
+  </div>
+</div>
+
+<!-- Controls + Timer -->
+<div class="row" style="margin-bottom:1rem">
+  <div class="card grow">
+    <div class="card-title">Control de Carrera</div>
+    <div class="controls">
+      <label style="font-size:.8rem;color:#8b949e">Duración (min):
+        <input type="number" id="durationInput" min="1" max="999" step="1" value="5" style="width:70px">
+      </label>
+      <button class="btn btn--go"    id="btnGo"     disabled>▶ GO</button>
+      <button class="btn btn--pause" id="btnPause"  disabled>⏸ Pausa</button>
+      <button class="btn btn--stop"  id="btnStop"   disabled>⏹ Stop</button>
+    </div>
+    <div style="margin-top:.5rem;font-size:.75rem;color:#6e7681">
+      Nota: GO, Pause y Stop envían las tramas DS-300 reales al puerto serie.
+    </div>
+  </div>
+  <div class="card" style="min-width:160px;text-align:center">
+    <div class="card-title">Tiempo Restante</div>
+    <div class="timer idle" id="timer">5:00</div>
+    <div class="state-label idle" id="stateLabel">EN ESPERA</div>
+  </div>
+</div>
+
+<!-- Lanes -->
+<div class="card">
+  <div class="card-title">Carriles</div>
+  <div class="lanes-grid" id="lanesGrid"></div>
+</div>
+
+<!-- Log -->
+<div class="card">
+  <div class="card-title">Log de Tramas</div>
+  <div class="log" id="log"></div>
+</div>
+
+<!-- Help -->
+<div class="card">
+  <div class="card-title">Configuración de Puerto Virtual (macOS / Linux)</div>
+  <div class="help">
+    Crea un par de puertos virtuales enlazados con socat:<br>
+    <code>socat -d -d pty,raw,echo=0 pty,raw,echo=0</code><br>
+    Verás algo como <code>/dev/ttys001</code> y <code>/dev/ttys002</code>.<br>
+    Conecta el emulador al primero y configura SloTime con el segundo.<br><br>
+    <strong>Windows:</strong> usa <a href="https://sourceforge.net/projects/com0com/" target="_blank" style="color:#58a6ff">com0com</a>
+    para crear un par virtual COM3↔COM4.
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket = io();
+
+const LANE_COLORS = [
+  '#e63946','#2196f3','#4caf50','#ff9800','#9c27b0','#00bcd4','#ff5722','#607d8b'
+];
+
+// ── Build lane cards ──────────────────────────────────────────────────────────
+const grid = document.getElementById('lanesGrid');
+for (let i = 1; i <= 8; i++) {
+  const color = LANE_COLORS[i - 1];
+  const card = document.createElement('div');
+  card.className = 'lane-card';
+  card.style.setProperty('--lane-color', color);
+  card.id = `lc-${i}`;
+  card.innerHTML = `
+    <div class="lane-card__header">
+      <span class="lane-num">${i}</span>
+      <span style="font-size:.7rem;color:#8b949e">Carril ${i}</span>
+    </div>
+    <div class="lane-laps" id="laps-${i}">0</div>
+    <div class="lane-last" id="last-${i}">—</div>
+    <div class="lane-avg-row">
+      <span class="lane-avg-label">Media:</span>
+      <input class="lane-avg-input" id="avg-${i}" type="number" min="3" max="60" step="0.5" value="${(9 + (i-1)*0.3).toFixed(1)}">
+      <span class="lane-avg-label">s</span>
+    </div>`;
+  grid.appendChild(card);
+
+  document.getElementById(`avg-${i}`).addEventListener('change', function() {
+    socket.emit('set_avg_lap', { lane: i, ms: Math.round(parseFloat(this.value) * 1000) });
+  });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function formatMs(ms) {
+  if (!ms) return '—';
+  const s  = Math.floor(ms / 1000);
+  const cs = Math.floor((ms % 1000) / 10);
+  return `${s}.${String(cs).padStart(2, '0')}s`;
+}
+function formatCountdown(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${String(sec).padStart(2, '0')}`;
+}
+function addLog(text, cls = '') {
+  const log = document.getElementById('log');
+  const p = document.createElement('p');
+  if (cls) p.className = cls;
+  const now = new Date();
+  p.textContent = `[${now.toTimeString().slice(0,8)}] ${text}`;
+  log.appendChild(p);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ── Port ──────────────────────────────────────────────────────────────────────
+socket.on('ports', (ports) => {
+  const sel = document.getElementById('portSelect');
+  sel.innerHTML = '<option value="">-- seleccionar --</option>';
+  ports.forEach(p => {
+    const o = document.createElement('option');
+    o.value = o.textContent = p;
+    sel.appendChild(o);
+  });
+});
+document.getElementById('portSelect').addEventListener('change', function() {
+  if (this.value) document.getElementById('portInput').value = this.value;
+});
+document.getElementById('btnRefresh').addEventListener('click', () => socket.emit('list_ports'));
+document.getElementById('btnConnect').addEventListener('click', () => {
+  const port = document.getElementById('portInput').value.trim();
+  const baud = parseInt(document.getElementById('baudInput').value) || 56000;
+  if (!port) { addLog('Indica un puerto', 'warn'); return; }
+  socket.emit('connect_port', { port, baud });
+});
+document.getElementById('btnDisconnect').addEventListener('click', () => socket.emit('disconnect_port'));
+
+socket.on('connected', ({ port }) => {
+  document.getElementById('connDot').className  = 'conn-dot on';
+  document.getElementById('connBadge').innerHTML = `<span class="conn-dot on"></span>${port}`;
+  document.getElementById('btnConnect').disabled    = true;
+  document.getElementById('btnDisconnect').disabled = false;
+  document.getElementById('btnGo').disabled         = false;
+  addLog(`Conectado a ${port}`, 'info');
+});
+socket.on('disconnected', () => {
+  document.getElementById('connDot').className   = 'conn-dot';
+  document.getElementById('connBadge').innerHTML = `<span class="conn-dot"></span>Desconectado`;
+  document.getElementById('btnConnect').disabled    = false;
+  document.getElementById('btnDisconnect').disabled = true;
+  document.getElementById('btnGo').disabled         = true;
+  document.getElementById('btnPause').disabled      = true;
+  document.getElementById('btnStop').disabled       = true;
+  addLog('Puerto desconectado', 'warn');
+});
+socket.on('port_error',    msg => addLog('Error: ' + msg, 'error'));
+socket.on('port_error',    msg => addLog('Error puerto: ' + msg, 'error'));
+
+// ── Race controls ─────────────────────────────────────────────────────────────
+document.getElementById('btnGo').addEventListener('click',    () => {
+  const mins = parseInt(document.getElementById('durationInput').value, 10) || 5;
+  socket.emit('go', { durationMin: mins });
+});
+document.getElementById('btnPause').addEventListener('click', () => {
+  const label = document.getElementById('stateLabel').textContent;
+  socket.emit(label === 'PAUSADA' ? 'resume' : 'pause');
+});
+document.getElementById('btnStop').addEventListener('click', () => socket.emit('stop'));
+
+socket.on('race_state', (data) => {
+  const timerEl  = document.getElementById('timer');
+  const stateEl  = document.getElementById('stateLabel');
+  const btnGo    = document.getElementById('btnGo');
+  const btnPause = document.getElementById('btnPause');
+  const btnStop  = document.getElementById('btnStop');
+
+  timerEl.textContent = formatCountdown(data.remainingMs);
+  timerEl.className   = `timer ${data.state}`;
+  stateEl.className   = `state-label ${data.state}`;
+
+  switch (data.state) {
+    case 'idle':
+      stateEl.textContent = 'EN ESPERA';
+      btnGo.disabled    = !data.connected && !document.getElementById('btnDisconnect').disabled === false;
+      btnPause.disabled = true;
+      btnStop.disabled  = true;
+      btnPause.textContent = '⏸ Pausa';
+      break;
+    case 'running':
+      stateEl.textContent = 'EN CARRERA';
+      btnGo.disabled    = true;
+      btnPause.disabled = false;
+      btnStop.disabled  = false;
+      btnPause.textContent = '⏸ Pausa';
+      break;
+    case 'paused':
+      stateEl.textContent = 'PAUSADA';
+      btnGo.disabled    = true;
+      btnPause.disabled = false;
+      btnStop.disabled  = false;
+      btnPause.textContent = '▶ Reanudar';
+      break;
+    case 'finished':
+      stateEl.textContent = 'FINALIZADA';
+      btnGo.disabled    = false;
+      btnPause.disabled = true;
+      btnStop.disabled  = true;
+      btnPause.textContent = '⏸ Pausa';
+      timerEl.textContent = '0:00';
+      break;
+  }
+
+  // Update lane cards
+  if (data.lanes) {
+    for (let i = 1; i <= 8; i++) {
+      const l = data.lanes[i];
+      if (!l) continue;
+      document.getElementById(`laps-${i}`).textContent = l.lapCount;
+      document.getElementById(`last-${i}`).textContent = formatMs(l.lastLapMs);
+    }
+  }
+
+  // Enable GO if connected (initial state sync)
+  if (data.connected && data.state === 'idle') btnGo.disabled = false;
+});
+
+socket.on('lap', ({ lane, lapCount, lapTimeMs }) => {
+  document.getElementById(`laps-${lane}`).textContent = lapCount;
+  document.getElementById(`last-${lane}`).textContent = formatMs(lapTimeMs);
+});
+
+socket.on('log', (msg) => addLog(msg, msg.startsWith('✓') || msg.startsWith('▶') ? 'info' : msg.startsWith('✗') ? 'error' : 'warn'));
+
+// ── Initial state ─────────────────────────────────────────────────────────────
+socket.on('connect', () => {
+  socket.emit('list_ports');
+  addLog('Emulador DS-300 listo', 'info');
+});
+</script>
+</body>
+</html>

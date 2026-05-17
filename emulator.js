@@ -1,0 +1,626 @@
+'use strict';
+
+const express    = require('express');
+const http       = require('http');
+const { Server } = require('socket.io');
+const { SerialPort } = require('serialport');
+const path       = require('path');
+
+const app    = express();
+const server = http.createServer(app);
+const io     = new Server(server);
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+const PORT     = parseInt(process.env.DS_HTTP_PORT || '3100', 10);
+const DEFAULT_DURATION_MIN = parseInt(process.env.DS_DURATION_MIN || '5', 10);
+let RACE_DURATION_MS = DEFAULT_DURATION_MIN * 60 * 1000;
+const NUM_LANES        = parseInt(process.env.DS_LANES || '8', 10);
+const FRAME_GAP_MS     = 110; // silence gap between frames (DS-300 needs >75ms)
+
+// ── DS-300 frame protocol (verified against real hardware capture) ──────────
+//
+// Frame: 21 bytes
+//   [0]    = 0xE0  (sync)
+//   [1]    = counter (increments per frame, 0x00-0xFF, rolls over)
+//   [2-6]  = 15 03 00 04 4C (fixed header)
+//   [7]    = 0x3E (GO marker) | 0x1B (crossing) | 0x00 (control: A2/A3/A4/A7)
+//   [8]    = event type
+//   [9]    = 0x00
+//   [10]   = lane bitmask | BCD duration (GO) | 0x00 (control)
+//   [11]   = 0x00
+//   [12]   = lap counter (1..N) for crossings, 0x00 for control
+//   [13]   = 0x00
+//   [14]   = 0xAA → first-crossing marker (invalid time) | BCD mins
+//   [15-17]= BCD secs/cents/dmils (or pseudo-bytes if first crossing)
+//   [18]   = checksum-like byte (varies)
+//   [19]   = 0x00
+//   [20]   = 0xEB  (end marker)
+//
+// GO sequence (3 frames, real hardware timing):
+//   Trama 1 (t=0):       [7]=0x3E [8]=0xA1 [10]=BCD(durationMins)  ← race info + start
+//   Trama 2 (t≈+2500ms): [7]=0x00 [8]=0xA2                          ← intermediate step
+//   Trama 3 (t≈+2953ms): [7]=0x00 [8]=0xA3                          ← current ON / countdown starts
+//
+// Other control frames:
+//   Finish:      [7]=0x00 [8]=0xA4
+//   ForcedStop:  [7]=0x00 [8]=0xA7
+//   Pause:       [1]=0x0C (frame counter override, no lane)
+//   Resume:      [1]=0x0F
+
+const LANE_MASK = [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01];
+
+let frameCounter = 0xD0; // start at a recognizable value
+
+function nextCounter() {
+  frameCounter = (frameCounter + 1) & 0xFF;
+  return frameCounter;
+}
+
+// BCD encode: 12 → 0x12, 59 → 0x59
+function bcd(n) {
+  n = Math.min(99, Math.max(0, Math.round(n)));
+  return ((Math.floor(n / 10)) << 4) | (n % 10);
+}
+
+// Encode lap time (integer ms) into 4 DS-300 BCD bytes
+// Formula inverse: ms = mins*60000 + secs*1000 + cents*10 + dmils*0.1
+function encodeLapTime(ms) {
+  const t     = Math.round(ms);
+  const mins  = Math.floor(t / 60000);
+  const secs  = Math.floor((t % 60000) / 1000);
+  const cents = Math.floor((t % 1000) / 10);
+  const dmils = (t % 10) * 10; // ten-thousandths (always 0 for integer ms)
+  return [bcd(mins), bcd(secs), bcd(cents), bcd(dmils)];
+}
+
+// Checksum B18 = (B1 + B2 + ... + B17) mod 256, per DS-300 protocol.
+// B0 (0xE0) and B20 (0xEB) excluded.
+function computeChecksum(b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17) {
+  return (b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9 + b10 + b11 + b12 + b13 + b14 + b15 + b16 + b17) & 0xFF;
+}
+
+function buildFrame(b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, _b18Ignored, b19, overrideCounter) {
+  const cnt = overrideCounter !== undefined ? overrideCounter : nextCounter();
+  const b18 = computeChecksum(cnt, 0x15, 0x03, 0x00, 0x04, 0x4C, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17);
+  return Buffer.from([
+    0xE0, cnt, 0x15, 0x03, 0x00, 0x04, 0x4C,
+    b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
+    0xEB
+  ]);
+}
+
+// DS-300 GO sequence per protocolo (DS300-protocolo.md):
+//   Trama GO:   B7=0x3E B8=0xA1  B9=BCD(centenas) B10=BCD(unidades) → duración en minutos
+//   Confirm 1:  B7=0x00 B8=0xA2  (ignorada por el receptor)
+//   Confirm 2:  B7=0x00 B8=0xA3  (ignorada por el receptor)
+// Ejemplo del protocolo (6 min): E0 59 15 03 00 04 4C 3E A1 00 06 00 00 00 00 00 00 00 A6 00 EB
+//   → checksum B18 = (0x59+0x15+0x03+0x00+0x04+0x4C+0x3E+0xA1+0x00+0x06) mod 256 = 0xA6 ✓
+function goFrame1() {
+  const durationMins = Math.max(1, Math.round(RACE_DURATION_MS / 60000));
+  const hundreds = Math.floor(durationMins / 100);
+  const units    = durationMins % 100;
+  return buildFrame(0x3E, 0xA1, bcd(hundreds), bcd(units), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+function goFrame2() {
+  return buildFrame(0x00, 0xA2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+function goFrame3() {
+  return buildFrame(0x00, 0xA3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+// Real GO sub-frame timing (ms from trama 1)
+const GO_T2_DELAY_MS = 2500;
+const GO_T3_DELAY_MS = 2953;
+
+// First crossing: byte[14]=0xAA marks invalid time; [12] holds the lap counter (=1)
+function firstCrossingFrame(lane) {
+  const lb = LANE_MASK[lane - 1];
+  return buildFrame(0x1B, 0xA9, 0x00, lb, 0x00, 0x01, 0x00, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+// Normal lap crossing: BCD lap time in [14..17], lap counter in [12]
+function lapCrossingFrame(lane, lapTimeMs, lapNum) {
+  const lb = LANE_MASK[lane - 1];
+  const [m, s, c, d] = encodeLapTime(lapTimeMs);
+  return buildFrame(0x1B, 0x00, 0x00, lb, 0x00, bcd(lapNum % 100), 0x00, m, s, c, d, 0x00, 0x00, 0x00);
+}
+
+// Pause: B7=0x00 (control), B8=0xA5 (per DS-300 protocol).
+function pauseFrame() {
+  return buildFrame(0x00, 0xA5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+// Resume: secuencia de 3 tramas (similar al GO):
+//   Trama 1 (t=0):       B7=0x00 B8=0xA6   ← marca reanudación
+//   Trama 2 (t≈+2500ms): B7=0x00 B8=0xA2   ← confirm 1
+//   Trama 3 (t≈+2953ms): B7=0x00 B8=0xA3   ← current ON / carrera vuelve a correr
+function resumeFrame1() {
+  return buildFrame(0x00, 0xA6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+function resumeFrame2() {
+  return buildFrame(0x00, 0xA2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+function resumeFrame3() {
+  return buildFrame(0x00, 0xA3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+// Resume sub-frame timing (reusa los delays del GO por similitud de patrón)
+const RESUME_T2_DELAY_MS = GO_T2_DELAY_MS;
+const RESUME_T3_DELAY_MS = GO_T3_DELAY_MS;
+
+// Normal end / finish: [7]=0x00 [8]=0xA4
+function finishFrame() {
+  return buildFrame(0x00, 0xA4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+// Forced stop: [7]=0x00 [8]=0xA7
+function stopFrame() {
+  return buildFrame(0x00, 0xA7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+// ── Serial port & frame queue ─────────────────────────────────────────────────
+
+let serialPort   = null;
+let frameQueue   = [];
+let drainTimer   = null;
+
+function queueFrame(buf) {
+  frameQueue.push(buf);
+  console.log(`[Queue] Encolado frame (byte[7]=${buf[7]?.toString(16)}, byte[8]=${buf[8]?.toString(16)}), total en cola: ${frameQueue.length}`);
+  if (!drainTimer) drainQueue();
+}
+
+function drainQueue() {
+  drainTimer = null;
+  if (!serialPort) {
+    console.log(`[Drain] Abortado: no puerto abierto`);
+    return;
+  }
+  if (frameQueue.length === 0) {
+    console.log(`[Drain] Cola vacía`);
+    return;
+  }
+  const buf = frameQueue.shift();
+  console.log(`[Drain] Escribiendo frame (byte[7]=${buf[7]?.toString(16)}, byte[8]=${buf[8]?.toString(16)}), ${frameQueue.length} restantes en cola`);
+  serialPort.write(buf, err => {
+    if (err) console.error('[Serial] Write error:', err.message);
+  });
+  drainTimer = setTimeout(drainQueue, FRAME_GAP_MS);
+}
+
+async function connectPort(portPath, baudRate = 56000) {
+  if (serialPort) {
+    await new Promise(r => serialPort.close(r));
+    serialPort = null;
+  }
+  frameQueue = [];
+  if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+
+  // Try the requested baud rate; if macOS rejects it (pty + non-standard rate),
+  // fall back to 57600 — for virtual ports the rate is irrelevant.
+  const rates = baudRate !== 57600 ? [baudRate, 57600] : [57600];
+  let lastErr;
+  for (const rate of rates) {
+    const p = new SerialPort({ path: portPath, baudRate: rate, autoOpen: false });
+    const err = await new Promise(r => p.open(e => r(e)));
+    if (!err) {
+      serialPort = p;
+      serialPort.on('error', e => {
+        console.error('[Serial] Port error:', e.message);
+        io.emit('port_error', e.message);
+      });
+      console.log(`[Serial] Connected to ${portPath} @ ${rate} baud`);
+      return;
+    }
+    lastErr = err;
+    console.warn(`[Serial] ${portPath} @ ${rate} failed: ${err.message}`);
+  }
+  throw lastErr;
+}
+
+async function listPorts() {
+  const fs = require('fs');
+  let real = [];
+  try { real = await SerialPort.list(); } catch {}
+  const out = real.map(p => ({ path: p.path }));
+  // Add /dev/ttys* (socat ptys) and common USB-serial paths — SerialPort.list()
+  // does not return them on macOS/Linux.
+  if (process.platform !== 'win32') {
+    try {
+      fs.readdirSync('/dev')
+        .filter(n => /^ttys\d{3,}$|^tty\.(usbserial|usbmodem|SLAB|wchusbserial)/i.test(n))
+        .map(n => '/dev/' + n)
+        .filter(p => !out.find(o => o.path === p))
+        .forEach(path => out.push({ path }));
+    } catch {}
+  }
+  out.sort((a, b) => a.path.localeCompare(b.path));
+  return out;
+}
+
+// ── Race state ────────────────────────────────────────────────────────────────
+
+const STATE = { IDLE: 'idle', RUNNING: 'running', PAUSED: 'paused', FINISHED: 'finished' };
+
+let raceState      = STATE.IDLE;
+let raceStartAt    = null;   // Date.now() when GO pressed
+let pauseStartAt   = null;   // Date.now() when paused
+let totalPausedMs  = 0;      // accumulated pause time
+let finishTimer    = null;
+let tickTimer      = null;
+
+// Per-lane state
+const laneState = {};
+for (let i = 1; i <= NUM_LANES; i++) {
+  laneState[i] = {
+    lapCount:       0,
+    lastLapMs:      null,
+    lastCrossingAt: null,  // Date.now() of last crossing
+    remainingInLap: null,  // ms remaining when paused
+    timer:          null,
+    avgLapMs:       9000 + (i - 1) * 300 + Math.floor(Math.random() * 800), // 9-12s per lane
+  };
+}
+
+function resetLanes() {
+  for (let i = 1; i <= NUM_LANES; i++) {
+    if (laneState[i].timer) clearTimeout(laneState[i].timer);
+    laneState[i].lapCount       = 0;
+    laneState[i].lastLapMs      = null;
+    laneState[i].lastCrossingAt = null;
+    laneState[i].remainingInLap = null;
+    laneState[i].timer          = null;
+    // Re-randomize slightly each race
+    laneState[i].avgLapMs = 9000 + (i - 1) * 300 + Math.floor(Math.random() * 800);
+  }
+}
+
+function elapsedMs() {
+  if (!raceStartAt) return 0;
+  return (Date.now() - raceStartAt) - totalPausedMs;
+}
+
+function remainingMs() {
+  return Math.max(0, RACE_DURATION_MS - elapsedMs());
+}
+
+// Random lap time with ±15% variation around average.
+// Anomalías aleatorias adicionales:
+//   - CRASH: penalización +3..15s (salida de pista)
+//   - PIT:   factor 1.8..2.2× avg  (parada en boxes / mecánica)
+const CRASH_PROB    = 0.03;   // ~3% de las vueltas
+const CRASH_MIN_MS  = 3000;
+const CRASH_MAX_MS  = 15000;
+const PIT_PROB      = 0.015;  // ~1.5% de las vueltas
+const PIT_MIN_MULT  = 1.8;
+const PIT_MAX_MULT  = 2.2;
+function randomLapMs(avgMs) {
+  const variation = avgMs * 0.15;
+  let lap = avgMs + (Math.random() * variation * 2 - variation);
+  if (Math.random() < CRASH_PROB) {
+    const penalty = CRASH_MIN_MS + Math.random() * (CRASH_MAX_MS - CRASH_MIN_MS);
+    lap += penalty;
+    console.log(`[Crash] Salida de pista simulada: +${(penalty/1000).toFixed(1)}s`);
+  } else if (Math.random() < PIT_PROB) {
+    const mult = PIT_MIN_MULT + Math.random() * (PIT_MAX_MULT - PIT_MIN_MULT);
+    lap = avgMs * mult;
+    console.log(`[Pit] Pit-stop simulado: ×${mult.toFixed(2)} (${(lap/1000).toFixed(2)}s)`);
+  }
+  return Math.round(lap);
+}
+
+function emitState() {
+  const lanes = {};
+  for (let i = 1; i <= NUM_LANES; i++) {
+    lanes[i] = { lapCount: laneState[i].lapCount, lastLapMs: laneState[i].lastLapMs };
+  }
+  io.emit('race_state', {
+    state:       raceState,
+    remainingMs: remainingMs(),
+    elapsedMs:   elapsedMs(),
+    lanes,
+  });
+}
+
+function scheduleLap(lane, delayMs) {
+  if (laneState[lane].timer) clearTimeout(laneState[lane].timer);
+  laneState[lane].timer = setTimeout(() => {
+    if (raceState !== STATE.RUNNING) return;
+    doLapCrossing(lane);
+  }, delayMs);
+}
+
+// Ghost-lap simulation: a crossing is mis-attributed to a neighbour lane.
+// The ghost lane gets a fake short lap (avg - 3s) and the real lane gets a
+// fake long lap (avg * 2) because it appears to have skipped a crossing.
+const GHOST_PROB = 0.02; // ~2% de las cruzadas
+
+function maybeGhostLap(lane, now) {
+  if (Math.random() >= GHOST_PROB) return false;
+  // Candidatos: otros carriles ya en marcha (con lastCrossingAt válido)
+  const candidates = [];
+  for (let i = 1; i <= NUM_LANES; i++) {
+    if (i !== lane && laneState[i].lastCrossingAt !== null) candidates.push(i);
+  }
+  if (candidates.length === 0) return false;
+  const ghost = candidates[Math.floor(Math.random() * candidates.length)];
+  const g = laneState[ghost];
+  const s = laneState[lane];
+
+  // 1) Trama fantasma en el carril vecino: vuelta corta (avg - 3s)
+  const ghostLapMs = Math.max(1000, g.avgLapMs - 3000);
+  g.lapCount++;
+  g.lastLapMs      = ghostLapMs;
+  g.lastCrossingAt = now;
+  queueFrame(lapCrossingFrame(ghost, ghostLapMs, g.lapCount));
+  io.emit('lap', { lane: ghost, lapCount: g.lapCount, lapTimeMs: ghostLapMs, ghost: true });
+  // Reprograma su próxima cruzada desde ahora
+  const ghostNext = randomLapMs(g.avgLapMs);
+  g.remainingInLap = ghostNext;
+  scheduleLap(ghost, ghostNext);
+
+  // 2) Trama en el carril real: vuelta doble (parece que se saltó una)
+  const longLapMs = s.avgLapMs * 2;
+  s.lapCount++;
+  s.lastLapMs      = longLapMs;
+  s.lastCrossingAt = now;
+  queueFrame(lapCrossingFrame(lane, longLapMs, s.lapCount));
+  io.emit('lap', { lane, lapCount: s.lapCount, lapTimeMs: longLapMs, ghost: true });
+
+  console.log(`[Ghost] Carril ${lane} → fantasma en carril ${ghost} ` +
+              `(${(ghostLapMs/1000).toFixed(2)}s) | ${lane} doble (${(longLapMs/1000).toFixed(2)}s)`);
+  return true;
+}
+
+function doLapCrossing(lane) {
+  const s = laneState[lane];
+  const now = Date.now();
+
+  if (s.lastCrossingAt === null) {
+    // First crossing — no lap time
+    queueFrame(firstCrossingFrame(lane));
+    s.lastCrossingAt = now;
+    s.lapCount       = 0;
+  } else if (maybeGhostLap(lane, now)) {
+    // El fantasma ya emitió ambas tramas y actualizó estados
+  } else {
+    const lapTimeMs = now - s.lastCrossingAt;
+    s.lapCount++;
+    s.lastLapMs      = lapTimeMs;
+    s.lastCrossingAt = now;
+    queueFrame(lapCrossingFrame(lane, lapTimeMs, s.lapCount));
+    io.emit('lap', { lane, lapCount: s.lapCount, lapTimeMs });
+  }
+
+  // Schedule next crossing
+  const nextLap = randomLapMs(s.avgLapMs);
+  s.remainingInLap = nextLap;
+  scheduleLap(lane, nextLap);
+  emitState();
+}
+
+function startRace(durationMin) {
+  if (raceState === STATE.RUNNING) return;
+  if (durationMin && durationMin > 0) {
+    RACE_DURATION_MS = Math.min(999, Math.max(1, Math.round(durationMin))) * 60 * 1000;
+  }
+  resetLanes();
+  raceState     = STATE.RUNNING;
+  totalPausedMs = 0;
+  // El cronómetro real empieza al enviar T3 (A3 = current ON). Hasta entonces
+  // raceStartAt = null para que elapsedMs() devuelva 0 durante la cuenta atrás.
+  raceStartAt   = null;
+
+  // Real DS-300 GO sequence: 3 frames at t=0 / +2500ms / +2953ms
+  queueFrame(goFrame1());
+  setTimeout(() => queueFrame(goFrame2()), GO_T2_DELAY_MS);
+  setTimeout(() => {
+    queueFrame(goFrame3());
+    // T3 enviada: ahora arranca la carrera de verdad
+    raceStartAt = Date.now();
+    finishTimer = setTimeout(finishRace, RACE_DURATION_MS);
+    tickTimer = setInterval(() => {
+      emitState();
+      if (remainingMs() <= 0) clearInterval(tickTimer);
+    }, 1000);
+
+    // Primeras cruzadas escalonadas 0.5–2.5s tras T3
+    for (let i = 1; i <= NUM_LANES; i++) {
+      scheduleLap(i, 500 + Math.round(Math.random() * 2000));
+    }
+    emitState();
+  }, GO_T3_DELAY_MS);
+
+  console.log(`[Race] GO pressed — duración ${RACE_DURATION_MS/60000} min, T3 en ${GO_T3_DELAY_MS}ms`);
+  emitState();
+}
+
+function pauseRace() {
+  if (raceState !== STATE.RUNNING) return;
+  raceState    = STATE.PAUSED;
+  pauseStartAt = Date.now();
+
+  // Cancel all lane timers and save remaining time
+  for (let i = 1; i <= NUM_LANES; i++) {
+    const s = laneState[i];
+    if (s.timer) {
+      clearTimeout(s.timer);
+      s.timer = null;
+      // Estimate remaining time in current lap based on when it was scheduled
+      // (remainingInLap was set at last crossing; subtract elapsed since then)
+      const elapsed = s.lastCrossingAt ? Date.now() - s.lastCrossingAt : 0;
+      s.remainingInLap = Math.max(500, (s.remainingInLap ?? s.avgLapMs) - elapsed);
+    }
+  }
+
+  // Pause the finish timer
+  if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+  if (tickTimer)   { clearInterval(tickTimer);  tickTimer   = null; }
+
+  queueFrame(pauseFrame());
+  console.log('[Race] Paused');
+  emitState();
+}
+
+function resumeRace() {
+  if (raceState !== STATE.PAUSED) return;
+
+  // Secuencia real DS-300: A6 → A2 → A3 (mismos delays que GO).
+  // Hasta que se envía T3 (A3) la carrera sigue lógicamente PAUSED:
+  // los lap timers y el finishTimer no se rearman hasta entonces.
+  queueFrame(resumeFrame1());
+  console.log('[Race] Resume sequence — T1 (0xA6)');
+  emitState();
+
+  setTimeout(() => {
+    if (raceState !== STATE.PAUSED) return;
+    queueFrame(resumeFrame2());
+    console.log('[Race] Resume sequence — T2 (0xA2)');
+  }, RESUME_T2_DELAY_MS);
+
+  setTimeout(() => {
+    if (raceState !== STATE.PAUSED) return;
+    queueFrame(resumeFrame3());
+    console.log('[Race] Resume sequence — T3 (0xA3) — running');
+
+    // Ahora sí: carrera corriendo otra vez
+    const pausedDuration = Date.now() - pauseStartAt;
+    totalPausedMs += pausedDuration;
+    raceState = STATE.RUNNING;
+
+    // Ajusta lastCrossingAt por toda la pausa (incluyendo los ~3s de secuencia)
+    for (let i = 1; i <= NUM_LANES; i++) {
+      const s = laneState[i];
+      if (s.lastCrossingAt) s.lastCrossingAt += pausedDuration;
+      if (s.remainingInLap != null) scheduleLap(i, s.remainingInLap);
+    }
+
+    finishTimer = setTimeout(finishRace, remainingMs());
+    tickTimer   = setInterval(() => {
+      emitState();
+      if (remainingMs() <= 0) clearInterval(tickTimer);
+    }, 1000);
+
+    emitState();
+  }, RESUME_T3_DELAY_MS);
+}
+
+function finishRace() {
+  if (raceState === STATE.FINISHED || raceState === STATE.IDLE) return;
+  raceState = STATE.FINISHED;
+
+  for (let i = 1; i <= NUM_LANES; i++) {
+    if (laneState[i].timer) { clearTimeout(laneState[i].timer); laneState[i].timer = null; }
+  }
+  if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+  if (tickTimer)   { clearInterval(tickTimer);  tickTimer   = null; }
+
+  queueFrame(finishFrame());
+  console.log('[Race] Finished');
+  emitState();
+}
+
+function stopRace() {
+  if (raceState === STATE.IDLE) return;
+  raceState = STATE.IDLE;
+
+  for (let i = 1; i <= NUM_LANES; i++) {
+    if (laneState[i].timer) { clearTimeout(laneState[i].timer); laneState[i].timer = null; }
+  }
+  if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+  if (tickTimer)   { clearInterval(tickTimer);  tickTimer   = null; }
+
+  queueFrame(stopFrame());
+  resetLanes();
+  console.log('[Race] Stopped');
+  emitState();
+}
+
+// ── Socket.io ─────────────────────────────────────────────────────────────────
+
+io.on('connection', async (socket) => {
+  console.log('[WS] Client connected');
+
+  const ports = await listPorts();
+  socket.emit('ports', ports.map(p => p.path));
+  socket.emit('race_state', {
+    state:       raceState,
+    remainingMs: remainingMs(),
+    elapsedMs:   elapsedMs(),
+    lanes:       Object.fromEntries(
+      Array.from({ length: NUM_LANES }, (_, i) => [i + 1, {
+        lapCount: laneState[i + 1].lapCount,
+        lastLapMs: laneState[i + 1].lastLapMs,
+      }])
+    ),
+    connected: !!serialPort,
+  });
+
+  socket.on('connect_port', async ({ port, baud }) => {
+    try {
+      await connectPort(port, baud || 56000);
+      socket.emit('connected', { port });
+      io.emit('log', `✓ Conectado a ${port} @ ${baud || 56000} baud`);
+    } catch (err) {
+      socket.emit('port_error', err.message);
+      io.emit('log', `✗ Error: ${err.message}`);
+    }
+  });
+
+  socket.on('disconnect_port', async () => {
+    if (serialPort) {
+      await new Promise(r => serialPort.close(r)).catch(() => {});
+      serialPort = null;
+      io.emit('disconnected');
+      io.emit('log', 'Puerto desconectado');
+    }
+  });
+
+  socket.on('list_ports', async () => {
+    const ports = await listPorts();
+    socket.emit('ports', ports.map(p => p.path));
+  });
+
+  socket.on('go',     (payload) => {
+    const mins = payload && payload.durationMin;
+    startRace(mins);
+    io.emit('log', `▶ GO — carrera iniciada (${RACE_DURATION_MS/60000} min)`);
+  });
+  socket.on('pause',  () => { pauseRace();  io.emit('log', '⏸ Carrera pausada'); });
+  socket.on('resume', () => { resumeRace(); io.emit('log', '▶ Carrera reanudada'); });
+  socket.on('stop',   () => { stopRace();   io.emit('log', '⏹ Carrera detenida'); });
+
+  socket.on('set_avg_lap', ({ lane, ms }) => {
+    if (lane >= 1 && lane <= NUM_LANES) {
+      laneState[lane].avgLapMs = Math.max(3000, Math.min(60000, ms));
+      io.emit('log', `Carril ${lane}: media ajustada a ${(ms/1000).toFixed(1)}s`);
+    }
+  });
+});
+
+// REST endpoints for automated testing / CLI control
+app.post('/api/connect', express.json(), async (req, res) => {
+  try {
+    const port = (req.body && req.body.port) || '/dev/ttys002';
+    const baud = (req.body && req.body.baud) || 56000;
+    await connectPort(port, baud);
+    io.emit('connected', { port });
+    io.emit('log', `✓ Conectado a ${port} @ ${baud} baud`);
+    res.json({ ok: true, port });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+app.post('/api/go',   express.json(), (req, res) => {
+  const mins = req.body && req.body.durationMin;
+  startRace(mins);
+  res.json({ ok: true, durationMin: RACE_DURATION_MS / 60000 });
+});
+app.post('/api/stop', (req, res) => { stopRace();  res.json({ ok: true }); });
+
+server.listen(PORT, () => {
+  console.log(`DS-300 Emulator → http://localhost:${PORT}`);
+  console.log('');
+  console.log('Para crear un par de puertos virtuales en macOS:');
+  console.log('  socat -d -d pty,raw,echo=0 pty,raw,echo=0');
+  console.log('Luego conecta el emulador a /dev/ttys00X y SloTime a /dev/ttys00Y');
+});

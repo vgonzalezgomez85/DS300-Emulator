@@ -1,0 +1,12 @@
+{
+  "name": "ds300-emulator",
+  "version": "1.0.0",
+  "description": "DS-300 serial port emulator for SloTime",
+  "main": "emulator.js",
+  "scripts": { "start": "node emulator.js" },
+  "dependencies": {
+    "express": "^4.18.0",
+    "serialport": "^12.0.0",
+    "socket.io": "^4.7.0"
+  }
+}
