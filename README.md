@@ -48,6 +48,41 @@ Se sirve la UI web en **http://localhost:3100**.
 
 ---
 
+## Director de carrera (multi-DS)
+
+En carreras grandes de **2 a 4 circuitos**, cada DS controla un circuito (hasta 8
+carriles). Darle al GO en los 4 DS a la vez "necesita 4 manos". El **Director de
+carrera** es un panel maestro que descubre los emuladores en marcha y reenvía
+**GO / pausa / reanudar / stop** a los circuitos que marques, **en paralelo**
+(casi simultáneo) — desde una sola pantalla.
+
+Cada circuito sigue siendo un emulador independiente (proceso + puerto serie
+propio), exactamente como 4 DS reales: SloTime ve N puertos serie independientes.
+
+```bash
+# 1. Arranca los emuladores (en SloTime: ./start-emulators.sh → 2-4 instancias en 3100, 3101, …)
+# 2. Arranca el director:
+npm run director
+# → http://localhost:3099
+```
+
+El director **no emula nada**: solo orquesta por HTTP los emuladores ya vivos
+(fan-out server-side, sin CORS). Por defecto escanea los puertos `3100-3103`.
+
+| Variable           | Default       | Descripción |
+|--------------------|---------------|-------------|
+| `DS_DIRECTOR_PORT` | `3099`        | Puerto HTTP del panel director |
+| `DS_DIRECTOR_SCAN` | `3100-3103`   | Puertos de emulador a escanear (rango `3100-3107` o lista `3100,3101,3105`) |
+
+### API del director
+
+| Endpoint        | Método | Acción |
+|-----------------|--------|--------|
+| `/api/units`    | GET    | Sondea los emuladores y devuelve su estado (online, puerto serie, estado de carrera, cronómetro) |
+| `/api/control`  | POST   | Fan-out de una acción: `{ action: "go"\|"pause"\|"resume"\|"stop", ports: [3100,…], durationMin? }` |
+
+---
+
 ## Protocolo implementado
 
 ### Estructura de trama (21 bytes)
@@ -99,10 +134,11 @@ Los delays GO/Resume son configurables vía las constantes `GO_T*_DELAY_MS` y `R
 
 | Endpoint         | Método | Acción |
 |------------------|--------|--------|
-| `/api/go`        | POST   | Lanzar GO (body opcional: `{ duration }`) |
+| `/api/go`        | POST   | Lanzar GO (body opcional: `{ durationMin }`) |
 | `/api/pause`     | POST   | Pausar |
 | `/api/resume`    | POST   | Reanudar (envía secuencia A6→A2→A3) |
 | `/api/stop`      | POST   | Forced stop |
+| `/api/status`    | GET    | Estado del DS (conexión, puerto serie, estado de carrera, cronómetro) |
 | `/api/connect`   | POST   | Abrir puerto serie (body: `{ port }`) |
 
 Mismas acciones disponibles vía Socket.IO desde la UI.

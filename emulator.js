@@ -714,9 +714,26 @@ app.post('/api/connect', express.json(), async (req, res) => {
 app.post('/api/go',   express.json(), (req, res) => {
   const mins = req.body && req.body.durationMin;
   startRace(mins);
-  res.json({ ok: true, durationMin: RACE_DURATION_MS / 60000 });
+  io.emit('log', `▶ GO — carrera iniciada (${RACE_DURATION_MS / 60000} min)`);
+  res.json({ ok: true, durationMin: RACE_DURATION_MS / 60000, state: raceState });
 });
-app.post('/api/stop', (req, res) => { stopReplay(); stopRace(); res.json({ ok: true }); });
+app.post('/api/pause',  (req, res) => { pauseRace();  io.emit('log', '⏸ Carrera pausada');   res.json({ ok: true, state: raceState }); });
+app.post('/api/resume', (req, res) => { resumeRace(); io.emit('log', '▶ Carrera reanudada'); res.json({ ok: true, state: raceState }); });
+app.post('/api/stop', (req, res) => { stopReplay(); stopRace(); io.emit('log', '⏹ Carrera detenida'); res.json({ ok: true, state: raceState }); });
+
+// Estado actual del DS — lo consume el Director de carrera para pintar cada unidad.
+app.get('/api/status', (req, res) => {
+  res.json({
+    ok:          true,
+    connected:   !!serialPort,
+    port:        serialPort ? serialPort.path : null,
+    state:       raceState,
+    remainingMs: remainingMs(),
+    elapsedMs:   elapsedMs(),
+    durationMin: RACE_DURATION_MS / 60000,
+    lanes:       NUM_LANES,
+  });
+});
 
 // Replay de un registro real con timing real. body: { file?, speed?, maxGapMs? }
 app.post('/api/replay', express.json(), (req, res) => {

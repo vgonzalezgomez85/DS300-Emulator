@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DS-300 · Director de Carrera</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0d1117; color: #c9d1d9;
+    min-height: 100vh; padding: 1.5rem;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; color: #e6edf3; letter-spacing: .05em; }
+  .header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
+  .badge {
+    background: #21262d; border: 1px solid #30363d;
+    border-radius: 6px; padding: .25rem .6rem; font-size: .75rem;
+    font-weight: 700; color: #8b949e; letter-spacing: .08em;
+  }
+  .card {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .card-title { font-size: .7rem; font-weight: 700; color: #8b949e;
+    text-transform: uppercase; letter-spacing: .08em; margin-bottom: .75rem; }
+
+  .btn {
+    padding: .4rem .9rem; border-radius: 6px; border: none;
+    font-size: .85rem; font-weight: 600; cursor: pointer; transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn:disabled { opacity: .35; cursor: not-allowed; }
+  .btn--ghost  { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .btn--go     { background: #16a34a; color: #fff; font-size: 1.15rem;
+                 padding: .7rem 2.2rem; border-radius: 8px; min-width: 150px; }
+  .btn--pause  { background: #ca8a04; color: #fff; font-size: 1rem; padding: .7rem 1.4rem; border-radius: 8px; }
+  .btn--resume { background: #2563eb; color: #fff; font-size: 1rem; padding: .7rem 1.4rem; border-radius: 8px; }
+  .btn--stop   { background: #b91c1c; color: #fff; font-size: 1rem; padding: .7rem 1.4rem; border-radius: 8px; }
+
+  .controls { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #30363d; display: inline-block; }
+  .dot.on    { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .dot.warn  { background: #ca8a04; box-shadow: 0 0 6px #ca8a04; }
+
+  /* ── Unidades ── */
+  .units { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .9rem; }
+  .unit {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: .9rem 1rem; border-left: 4px solid #30363d; transition: border-color .2s, opacity .2s;
+  }
+  .unit.sel        { border-left-color: #58a6ff; }
+  .unit.offline    { opacity: .45; }
+  .unit.running    { border-left-color: #3fb950; }
+  .unit.paused     { border-left-color: #ca8a04; }
+  .unit.finished   { border-left-color: #e63946; }
+  .unit__top { display: flex; align-items: center; gap: .55rem; margin-bottom: .6rem; }
+  .unit__top input[type=checkbox] { width: 18px; height: 18px; accent-color: #58a6ff; cursor: pointer; }
+  .unit__name { font-weight: 700; color: #e6edf3; font-size: 1rem; }
+  .unit__port { font-size: .7rem; color: #6e7681; margin-left: auto; }
+  .unit__row { display: flex; justify-content: space-between; align-items: center; font-size: .78rem; margin-top: .3rem; }
+  .unit__label { color: #8b949e; }
+  .unit__timer { font-family: 'Courier New', monospace; font-size: 1.5rem; font-weight: 700; color: #f6c90e; text-align: center; margin: .35rem 0 .15rem; }
+  .unit__timer.idle { color: #30363d; } .unit__timer.paused { color: #ca8a04; }
+  .unit__timer.finished { color: #e63946; }
+  .state-pill { font-size: .65rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    padding: .12rem .45rem; border-radius: 4px; background: #21262d; color: #8b949e; }
+  .state-pill.running  { background: #16341f; color: #3fb950; }
+  .state-pill.paused   { background: #3a2c08; color: #ca8a04; }
+  .state-pill.finished { background: #3a1115; color: #e63946; }
+  .state-pill.idle     { background: #21262d; color: #8b949e; }
+
+  .log {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: .75rem; height: 130px; overflow-y: auto; font-family: 'Courier New', monospace;
+    font-size: .75rem; color: #8b949e;
+  }
+  .log p { margin: .1rem 0; }
+  .log p.info  { color: #3fb950; }
+  .log p.warn  { color: #ca8a04; }
+  .log p.error { color: #e63946; }
+  .muted { color: #6e7681; font-size: .75rem; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🏁 Director de Carrera</h1>
+  <span class="badge">MULTI-DS · 2-4 CIRCUITOS</span>
+  <span class="badge" id="summaryBadge">— online · — seleccionados</span>
+  <button class="btn btn--ghost" id="btnRefresh" style="margin-left:auto">↺ Refrescar</button>
+</div>
+
+<!-- Control de grupo -->
+<div class="card">
+  <div class="card-title">Control de grupo (circuitos marcados)</div>
+  <div class="controls">
+    <label class="muted">Duración (min):
+      <input type="number" id="durationInput" min="1" max="999" step="1" value="5"
+             style="width:70px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:6px;padding:.35rem .5rem">
+    </label>
+    <button class="btn btn--go"     id="btnGo">▶ GO TODOS</button>
+    <button class="btn btn--pause"  id="btnPause">⏸ Pausa</button>
+    <button class="btn btn--resume" id="btnResume">▶ Reanudar</button>
+    <button class="btn btn--stop"   id="btnStop">⏹ Stop forzado</button>
+    <span style="margin-left:auto;display:flex;gap:.5rem">
+      <button class="btn btn--ghost" id="btnSelAll">Marcar todos</button>
+      <button class="btn btn--ghost" id="btnSelNone">Ninguno</button>
+    </span>
+  </div>
+  <div class="muted" style="margin-top:.5rem">
+    El GO se dispara en paralelo a todos los circuitos marcados, casi simultáneo. Solo se actúa sobre circuitos online.
+  </div>
+</div>
+
+<!-- Unidades -->
+<div class="card">
+  <div class="card-title">Circuitos detectados</div>
+  <div class="units" id="units"><span class="muted">Buscando emuladores…</span></div>
+</div>
+
+<!-- Log -->
+<div class="card">
+  <div class="card-title">Registro</div>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+let units = [];                       // último estado sondeado
+const selected = new Set();           // httpPorts marcados (persiste entre refrescos)
+let userTouchedSelection = false;     // si el usuario ya marcó/desmarcó algo
+
+function addLog(text, cls = '') {
+  const log = document.getElementById('log');
+  const p = document.createElement('p');
+  if (cls) p.className = cls;
+  p.textContent = `[${new Date().toTimeString().slice(0,8)}] ${text}`;
+  log.appendChild(p);
+  log.scrollTop = log.scrollHeight;
+  while (log.childNodes.length > 200) log.removeChild(log.firstChild);
+}
+
+function fmtCountdown(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+}
+
+const STATE_ES = { idle:'En espera', running:'En carrera', paused:'Pausada', finished:'Finalizada', offline:'Offline' };
+
+function render() {
+  const cont = document.getElementById('units');
+  cont.innerHTML = '';
+  let online = 0;
+  units.forEach(u => {
+    if (u.online) online++;
+    const isSel = selected.has(u.httpPort);
+    const div = document.createElement('div');
+    div.className = `unit ${u.online ? u.state : 'offline'} ${isSel ? 'sel' : ''}`;
+    div.innerHTML = `
+      <div class="unit__top">
+        <input type="checkbox" ${isSel ? 'checked' : ''} ${u.online ? '' : 'disabled'} data-port="${u.httpPort}">
+        <span class="unit__name">Circuito ${u.idx}</span>
+        <span class="unit__port">:${u.httpPort}</span>
+      </div>
+      <div class="unit__timer ${u.online ? u.state : 'idle'}">${u.online && u.state !== 'idle' ? fmtCountdown(u.remainingMs) : '—'}</div>
+      <div style="text-align:center;margin-bottom:.4rem"><span class="state-pill ${u.online ? u.state : 'idle'}">${STATE_ES[u.state] || u.state}</span></div>
+      <div class="unit__row"><span class="unit__label">Emulador</span><span><span class="dot ${u.online?'on':''}"></span> ${u.online ? 'online' : 'offline'}</span></div>
+      <div class="unit__row"><span class="unit__label">Puerto serie</span><span><span class="dot ${u.connected?'on':'warn'}"></span> ${u.serialPath ? u.serialPath.split('/').pop() : 'sin conectar'}</span></div>
+    `;
+    cont.appendChild(div);
+  });
+  if (!units.length) cont.innerHTML = '<span class="muted">No se han detectado emuladores. Arráncalos con start-emulators.sh.</span>';
+
+  cont.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    cb.addEventListener('change', () => {
+      userTouchedSelection = true;
+      const port = +cb.dataset.port;
+      if (cb.checked) selected.add(port); else selected.delete(port);
+      render();
+    });
+  });
+
+  document.getElementById('summaryBadge').textContent =
+    `${online} online · ${[...selected].length} seleccionados`;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/units');
+    const data = await r.json();
+    units = data.units || [];
+    // Selección por defecto la primera vez: todos los online (hasta que el usuario toque algo).
+    if (!userTouchedSelection) {
+      selected.clear();
+      units.filter(u => u.online).forEach(u => selected.add(u.httpPort));
+    } else {
+      // Limpia de la selección puertos que ya no están online.
+      [...selected].forEach(p => { const u = units.find(x => x.httpPort === p); if (!u || !u.online) selected.delete(p); });
+    }
+    render();
+  } catch (e) {
+    addLog('Error sondeando emuladores: ' + e.message, 'error');
+  }
+}
+
+async function control(action) {
+  const ports = units.filter(u => u.online && selected.has(u.httpPort)).map(u => u.httpPort);
+  if (!ports.length) { addLog('No hay circuitos online seleccionados', 'warn'); return; }
+  const body = { action, ports };
+  if (action === 'go') body.durationMin = parseInt(document.getElementById('durationInput').value, 10) || 5;
+  const labels = { go:'GO', pause:'PAUSA', resume:'REANUDAR', stop:'STOP' };
+  addLog(`${labels[action]} → circuitos ${ports.map(p => ':' + p).join(' ')}`, 'info');
+  try {
+    const r = await fetch('/api/control', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const data = await r.json();
+    (data.results || []).forEach(res => {
+      addLog(`  :${res.httpPort} → ${res.ok ? '✓ ' + (res.state || 'ok') : '✗ ' + (res.error || 'fallo')}`, res.ok ? 'info' : 'error');
+    });
+    refresh();
+  } catch (e) {
+    addLog('Error enviando control: ' + e.message, 'error');
+  }
+}
+
+document.getElementById('btnGo').addEventListener('click',     () => control('go'));
+document.getElementById('btnPause').addEventListener('click',  () => control('pause'));
+document.getElementById('btnResume').addEventListener('click', () => control('resume'));
+document.getElementById('btnStop').addEventListener('click',   () => control('stop'));
+document.getElementById('btnRefresh').addEventListener('click', refresh);
+document.getElementById('btnSelAll').addEventListener('click', () => {
+  userTouchedSelection = true; selected.clear();
+  units.filter(u => u.online).forEach(u => selected.add(u.httpPort)); render();
+});
+document.getElementById('btnSelNone').addEventListener('click', () => {
+  userTouchedSelection = true; selected.clear(); render();
+});
+
+addLog('Director de carrera listo', 'info');
+refresh();
+setInterval(refresh, 1000);   // refresco de estado/cronómetros
+</script>
+</body>
+</html>
