@@ -16,7 +16,12 @@ const PORT     = parseInt(process.env.DS_HTTP_PORT || '3100', 10);
 const DEFAULT_DURATION_MIN = parseInt(process.env.DS_DURATION_MIN || '5', 10);
 let RACE_DURATION_MS = DEFAULT_DURATION_MIN * 60 * 1000;
 const NUM_LANES        = parseInt(process.env.DS_LANES || '8', 10);
-const FRAME_GAP_MS     = 110; // silence gap between frames (DS-300 needs >75ms)
+// Cadencia mínima entre tramas, medida en 2 registros reales (RegistroCarrera /
+// registro carrera 2, 8000+ tramas cada uno): el DS-300 NUNCA manda dos tramas
+// a menos de ~160 ms — pico clarísimo en 160 ms, cero huecos < 75 ms. Cuando
+// tiene varios cruces buffereados los serializa a ~160 ms cada uno (no hace
+// ráfagas en el cable). Antes estaba en 110 (irrealmente apretado).
+const FRAME_GAP_MS     = 160;
 
 // ── DS-300 frame protocol (verified against real hardware capture) ──────────
 //
@@ -425,9 +430,14 @@ function startRace(durationMin) {
       if (remainingMs() <= 0) clearInterval(tickTimer);
     }, 1000);
 
-    // Primeras cruzadas escalonadas 0.5–2.5s tras T3
+    // Arranque REAL: en el GO todos los coches salen A LA VEZ y cruzan la línea
+    // casi simultáneamente (y la 1ª vuelta también la cierran casi juntos). Por
+    // eso agrupamos las primeras cruzadas en una ventana muy estrecha (~0–300ms,
+    // jitter pequeño por reacción/posición de parrilla) en lugar de escalonarlas.
+    // El DS las serializa a FRAME_GAP_MS (160ms): con 32 carriles eso son ~5s de
+    // ráfaga de cruces al inicio — exactamente el comportamiento real.
     for (let i = 1; i <= NUM_LANES; i++) {
-      scheduleLap(i, 500 + Math.round(Math.random() * 2000));
+      scheduleLap(i, 30 + Math.round(Math.random() * 270));
     }
     emitState();
   }, GO_T3_DELAY_MS);
@@ -531,10 +541,101 @@ function stopRace() {
   if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
   if (tickTimer)   { clearInterval(tickTimer);  tickTimer   = null; }
 
+  // Reset reloj de carrera: si no se ponen a null, elapsedMs() sigue creciendo
+  // contra el raceStartAt viejo y la UI muestra una cuenta atrás "fantasma".
+  raceStartAt   = null;
+  pauseStartAt  = null;
+  totalPausedMs = 0;
+
   queueFrame(stopFrame());
   resetLanes();
   console.log('[Race] Stopped');
   emitState();
+}
+
+// ── Modo REPLAY (máxima fidelidad) ────────────────────────────────────────────
+// Reproduce un registro REAL (RegistroCarrera.txt: "HH:MM:SS.mmm  B0..B20")
+// trama a trama con su TIMING REAL. Es la forma más fiel de emular el DS-300:
+// envía exactamente lo que mandó el aparato, con sus tiempos. Escribe directo
+// al puerto (sin la cola de FRAME_GAP_MS: el espaciado real ya está en los
+// deltas del registro). `speed` acelera/ralentiza; `maxGapMs` recorta esperas
+// largas (idle) para no aguardar minutos entre cruces.
+const fsRP = require('fs');
+const DEFAULT_REPLAY_FILE = process.env.DS_REPLAY_FILE
+  || '/Users/victor/SloTime/info para proyecto infolap slot/registro carrera 2/RegistroCarrera.txt';
+let replayTimer  = null;
+let replayActive = false;
+
+function parseCaptureFile(filePath) {
+  const text = fsRP.readFileSync(filePath, 'utf8');
+  const frames = [];
+  let prevMs = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const parts = raw.trim().split(/\s+/);
+    const m = parts[0] && parts[0].match(/^(\d{1,2}):(\d{2}):(\d{2})\.(\d{1,3})$/);
+    if (!m) continue;
+    const ms  = ((+m[1] * 3600 + +m[2] * 60 + +m[3]) * 1000) + +m[4];
+    const hex = parts.slice(1).filter(h => /^[0-9a-fA-F]{2}$/.test(h));
+    if (hex.length < 2) continue;
+    let delta = (prevMs == null) ? 0 : ms - prevMs;
+    if (delta < 0) delta = FRAME_GAP_MS;   // rollover de medianoche / línea corrupta
+    prevMs = ms;
+    frames.push({ delta, buf: Buffer.from(hex.map(h => parseInt(h, 16))) });
+  }
+  return frames;
+}
+
+function stopReplay() {
+  if (replayTimer) { clearTimeout(replayTimer); replayTimer = null; }
+  replayActive = false;
+}
+
+function startReplay(filePath, speed = 1, maxGapMs = null) {
+  stopRace();                 // corta la simulación generativa
+  stopReplay();
+  frameQueue = [];
+  if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+  if (!serialPort) { io.emit('log', '✗ Replay: no hay puerto conectado'); return { ok: false, error: 'no_port' }; }
+
+  let frames;
+  try { frames = parseCaptureFile(filePath); }
+  catch (e) { io.emit('log', `✗ Replay: ${e.message}`); return { ok: false, error: e.message }; }
+  if (!frames.length) { io.emit('log', '✗ Replay: registro vacío o ilegible'); return { ok: false, error: 'empty' }; }
+
+  speed = Math.max(0.1, Math.min(50, Number(speed) || 1));
+  replayActive = true;
+  io.emit('log', `▶ Replay: ${frames.length} tramas (${filePath.split('/').pop()}) @ ${speed}x`);
+  console.log(`[Replay] ${frames.length} frames @ ${speed}x — ${filePath}`);
+
+  let i = 0;
+  (function step() {
+    if (!replayActive || !serialPort) { stopReplay(); return; }
+    if (i >= frames.length) { io.emit('log', '✓ Replay terminado'); console.log('[Replay] done'); stopReplay(); return; }
+    serialPort.write(frames[i++].buf, err => { if (err) console.error('[Replay] write error:', err.message); });
+    let wait = frames[i] ? frames[i].delta : 0;
+    if (maxGapMs != null) wait = Math.min(wait, maxGapMs);
+    replayTimer = setTimeout(step, Math.max(0, Math.round(wait / speed)));
+  })();
+  return { ok: true, frames: frames.length, speed };
+}
+
+// ── Modo STRESS (TEST, NO realista) ───────────────────────────────────────────
+// El DS real NUNCA manda tramas a <160ms (medido). Esto NO emula al DS: escribe
+// N tramas de cruce en UNA sola escritura (pegadas, sin hueco) para simular lo
+// que ve el receptor cuando su event loop se bloquea y el SO le entrega varias
+// tramas juntas. Sirve para verificar que el de-merge de SloTime las separa.
+function burstTest(count = 6) {
+  if (!serialPort) { io.emit('log', '✗ Stress: no hay puerto'); return { ok: false, error: 'no_port' }; }
+  count = Math.max(2, Math.min(12, count | 0));
+  const bufs = [];
+  for (let lane = 1; lane <= count; lane++) {
+    const s = laneState[((lane - 1) % NUM_LANES) + 1];
+    bufs.push(lapCrossingFrame(((lane - 1) % NUM_LANES) + 1, 9000 + lane * 100, (s.lapCount || 0) + 1));
+  }
+  serialPort.write(Buffer.concat(bufs), err => { if (err) console.error('[Stress] write error:', err.message); });
+  io.emit('log', `⚠ Stress: ${count} tramas escritas PEGADAS (test de-merge, no realista)`);
+  console.log(`[Stress] ${count} frames back-to-back (${count * 21} bytes en una escritura)`);
+  return { ok: true, count };
 }
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
@@ -615,7 +716,22 @@ app.post('/api/go',   express.json(), (req, res) => {
   startRace(mins);
   res.json({ ok: true, durationMin: RACE_DURATION_MS / 60000 });
 });
-app.post('/api/stop', (req, res) => { stopRace();  res.json({ ok: true }); });
+app.post('/api/stop', (req, res) => { stopReplay(); stopRace(); res.json({ ok: true }); });
+
+// Replay de un registro real con timing real. body: { file?, speed?, maxGapMs? }
+app.post('/api/replay', express.json(), (req, res) => {
+  const file     = (req.body && req.body.file)     || DEFAULT_REPLAY_FILE;
+  const speed    = (req.body && req.body.speed)    || 1;
+  const maxGapMs = (req.body && req.body.maxGapMs != null) ? req.body.maxGapMs : null;
+  const r = startReplay(file, speed, maxGapMs);
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+// Test de-merge (NO realista): escribe N tramas pegadas. body: { count? }
+app.post('/api/burst', express.json(), (req, res) => {
+  const r = burstTest((req.body && req.body.count) || 6);
+  res.status(r.ok ? 200 : 400).json(r);
+});
 
 server.listen(PORT, () => {
   console.log(`DS-300 Emulator → http://localhost:${PORT}`);
