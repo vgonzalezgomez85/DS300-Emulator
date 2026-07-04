@@ -16,6 +16,9 @@ const PORT     = parseInt(process.env.DS_HTTP_PORT || '3100', 10);
 const DEFAULT_DURATION_MIN = parseInt(process.env.DS_DURATION_MIN || '5', 10);
 let RACE_DURATION_MS = DEFAULT_DURATION_MIN * 60 * 1000;
 const NUM_LANES        = parseInt(process.env.DS_LANES || '8', 10);
+// Media de vuelta fija para todos los carriles (ms). Si no se define DS_AVG_MS,
+// se usa la media aleatoria por carril de siempre (9-12s).
+const AVG_LAP_MS       = process.env.DS_AVG_MS ? parseInt(process.env.DS_AVG_MS, 10) : null;
 // Cadencia mínima entre tramas, medida en 2 registros reales (RegistroCarrera /
 // registro carrera 2, 8000+ tramas cada uno): el DS-300 NUNCA manda dos tramas
 // a menos de ~160 ms — pico clarísimo en 160 ms, cero huecos < 75 ms. Cuando
@@ -264,7 +267,7 @@ for (let i = 1; i <= NUM_LANES; i++) {
     lastCrossingAt: null,  // Date.now() of last crossing
     remainingInLap: null,  // ms remaining when paused
     timer:          null,
-    avgLapMs:       9000 + (i - 1) * 300 + Math.floor(Math.random() * 800), // 9-12s per lane
+    avgLapMs:       AVG_LAP_MS ?? (9000 + (i - 1) * 300 + Math.floor(Math.random() * 800)), // 9-12s per lane (o DS_AVG_MS)
   };
 }
 
@@ -277,7 +280,7 @@ function resetLanes() {
     laneState[i].remainingInLap = null;
     laneState[i].timer          = null;
     // Re-randomize slightly each race
-    laneState[i].avgLapMs = 9000 + (i - 1) * 300 + Math.floor(Math.random() * 800);
+    laneState[i].avgLapMs = AVG_LAP_MS ?? (9000 + (i - 1) * 300 + Math.floor(Math.random() * 800));
   }
 }
 
@@ -300,6 +303,7 @@ const CRASH_MAX_MS  = 15000;
 const PIT_PROB      = 0.015;  // ~1.5% de las vueltas
 const PIT_MIN_MULT  = 1.8;
 const PIT_MAX_MULT  = 2.2;
+const DEG_MS_PER_LAP = parseFloat(process.env.DS_DEG_MS_PER_LAP || '0');  // degradación goma (ms/vuelta)
 function randomLapMs(avgMs) {
   const variation = avgMs * 0.15;
   let lap = avgMs + (Math.random() * variation * 2 - variation);
@@ -336,45 +340,79 @@ function scheduleLap(lane, delayMs) {
   }, delayMs);
 }
 
-// Ghost-lap simulation: a crossing is mis-attributed to a neighbour lane.
-// The ghost lane gets a fake short lap (avg - 3s) and the real lane gets a
-// fake long lap (avg * 2) because it appears to have skipped a crossing.
-const GHOST_PROB = 0.02; // ~2% de las cruzadas
+// ── Vuelta fantasma (ghost lap) — modelo físico de cruce mal atribuido ─────────
+//
+// Fenómeno REAL del DS-300 (calibrado contra tramas_Italia_24h.txt, 160 595
+// cruces): el cross-talk entre carriles FÍSICAMENTE ADYACENTES hace que, cuando
+// el coche del carril R cruza, el sensor asigne el pulso al carril vecino G.
+// En la captura real esto se ve como vueltas de tiempo IMPOSIBLE (11 cruces con
+// t<4s sobre 160 595, todos en el rango 1,0–3,5 s; una vuelta normal ≈ 9,8 s).
+//
+// La cadena de consecuencias que reproducimos (una sola causa, dos carriles):
+//   • Carril G (FANTASMA): registra un cruce que no hizo → +1 vuelta con tiempo
+//     CORTO = (now − último cruce real de G), self-consistente con el reloj.
+//     Su coche real sigue en pista, así que su PRÓXIMO cruce real produce el
+//     "complemento" (~resto hasta una vuelta). Firma: 2 vueltas cortas que suman
+//     ~una normal. No reprogramamos su timer: el complemento sale solo.
+//   • Carril R (REAL): su cruce fue "robado" → VUELTA PERDIDA. No emite trama ni
+//     cuenta. Su siguiente cruce real reporta una vuelta ≈DOBLE (2 fusionadas),
+//     porque no actualizamos su lastCrossingAt aquí.
+//
+// Esto es lo que PitWall debe reconciliar: una corta imposible en G ↔ una doble
+// en R. El cross-talk sólo ocurre cuando un vecino cruzó HACE POCO (los dos
+// coches cerca de la línea): por eso exigimos que G sea adyacente y que su hueco
+// caiga en [GHOST_MIN_MS, GHOST_MAX_MS] — así el tiempo corto es realista Y
+// consistente con el reloj (no un valor inventado).
+const GHOST_PROB   = parseFloat(process.env.DS_GHOST_PROB || '0.03'); // prob. por oportunidad (vecino recién cruzado)
+const GHOST_MIN_MS = parseInt(process.env.DS_GHOST_MIN_MS || '700', 10);  // > MIN_CROSSING_MS(500) de PitWall: debe PASAR el filtro
+const GHOST_MAX_MS = parseInt(process.env.DS_GHOST_MAX_MS || '3500', 10); // techo del cruce corto observado en real
 
 function maybeGhostLap(lane, now) {
-  if (Math.random() >= GHOST_PROB) return false;
-  // Candidatos: otros carriles ya en marcha (con lastCrossingAt válido)
-  const candidates = [];
-  for (let i = 1; i <= NUM_LANES; i++) {
-    if (i !== lane && laneState[i].lastCrossingAt !== null) candidates.push(i);
+  // NUNCA en la apertura. Tras el GO el DS emite varios "primeros cruces" (AA,
+  // tiempo inválido) por carril durante el warmup, y la 1ª vuelta cronometrada
+  // no llega hasta ~1 vuelta después. Un cruce corto ahí es un PRIMER CRUCE, no
+  // un fantasma. Exigimos que el carril real ya tenga ≥1 vuelta cronometrada
+  // (lapCount>=2: el 1er cruce deja lapCount=1) antes de poder "robarle" un cruce.
+  if (laneState[lane].lapCount < 2) return false;
+
+  // Sólo carriles FÍSICAMENTE adyacentes (cross-talk real) y en régimen estable:
+  // el vecino también debe haber cronometrado ≥1 vuelta, para que su tiempo corto
+  // sea inequívocamente IMPOSIBLE (y no un primer cruce de apertura).
+  const qualified = [];
+  for (const g of [lane - 1, lane + 1]) {
+    if (g < 1 || g > NUM_LANES) continue;
+    const gs = laneState[g];
+    if (gs.lastCrossingAt === null || gs.lapCount < 2) continue;
+    const gap = now - gs.lastCrossingAt;
+    // El vecino cruzó hace poco → el tiempo fantasma será corto e imposible.
+    // Techo = min(GHOST_MAX_MS, mitad de su media): así el fantasma es "media
+    // vuelta o menos" Y el complemento (resto hasta su próximo cruce real) nunca
+    // baja de ~500 ms, aunque la media del carril sea corta (no lo filtraría PitWall).
+    const maxGap = Math.min(GHOST_MAX_MS, Math.floor(gs.avgLapMs * 0.5));
+    if (gap >= GHOST_MIN_MS && gap <= maxGap) qualified.push({ g, gap });
   }
-  if (candidates.length === 0) return false;
-  const ghost = candidates[Math.floor(Math.random() * candidates.length)];
-  const g = laneState[ghost];
-  const s = laneState[lane];
+  if (qualified.length === 0) return false;          // geometría no propicia: cruce normal
+  if (Math.random() >= GHOST_PROB) return false;     // hay oportunidad, pero no toca
 
-  // 1) Trama fantasma en el carril vecino: vuelta corta (avg - 3s)
-  const ghostLapMs = Math.max(1000, g.avgLapMs - 3000);
-  g.lapCount++;
-  g.lastLapMs      = ghostLapMs;
-  g.lastCrossingAt = now;
-  queueFrame(lapCrossingFrame(ghost, ghostLapMs, g.lapCount));
-  io.emit('lap', { lane: ghost, lapCount: g.lapCount, lapTimeMs: ghostLapMs, ghost: true });
-  // Reprograma su próxima cruzada desde ahora
-  const ghostNext = randomLapMs(g.avgLapMs);
-  g.remainingInLap = ghostNext;
-  scheduleLap(ghost, ghostNext);
+  const { g: ghost, gap: ghostLapMs } = qualified[Math.floor(Math.random() * qualified.length)];
+  const gS = laneState[ghost];
 
-  // 2) Trama en el carril real: vuelta doble (parece que se saltó una)
-  const longLapMs = s.avgLapMs * 2;
-  s.lapCount++;
-  s.lastLapMs      = longLapMs;
-  s.lastCrossingAt = now;
-  queueFrame(lapCrossingFrame(lane, longLapMs, s.lapCount));
-  io.emit('lap', { lane, lapCount: s.lapCount, lapTimeMs: longLapMs, ghost: true });
+  // 1) FANTASMA en el vecino adyacente: vuelta corta, self-consistente con el reloj.
+  //    NO tocamos su timer → cuando su coche real cruce, saldrá el "complemento".
+  gS.lapCount++;
+  gS.lastLapMs      = ghostLapMs;
+  gS.lastCrossingAt = now;
+  queueFrame(lapCrossingFrame(ghost, ghostLapMs, gS.lapCount));
+  io.emit('lap', { lane: ghost, lapCount: gS.lapCount, lapTimeMs: ghostLapMs, ghost: true, ghostType: 'phantom' });
 
-  console.log(`[Ghost] Carril ${lane} → fantasma en carril ${ghost} ` +
-              `(${(ghostLapMs/1000).toFixed(2)}s) | ${lane} doble (${(longLapMs/1000).toFixed(2)}s)`);
+  // 2) Carril REAL (lane): cruce robado → VUELTA PERDIDA. No emitimos trama ni
+  //    incrementamos ni actualizamos lastCrossingAt: su próximo cruce real saldrá
+  //    ≈doble. Sólo avisamos al panel del emulador (no va por serie a PitWall).
+  io.emit('lap', { lane, ghost: true, ghostType: 'lost' });
+
+  console.log(`[Ghost] Cruce del carril ${lane} mal atribuido al adyacente ${ghost}: ` +
+              `fantasma ${(ghostLapMs/1000).toFixed(2)}s en ${ghost} (+ complemento después) | ` +
+              `vuelta PERDIDA en ${lane} (su próxima saldrá ≈doble)`);
   return true;
 }
 
@@ -383,12 +421,17 @@ function doLapCrossing(lane) {
   const now = Date.now();
 
   if (s.lastCrossingAt === null) {
-    // First crossing — no lap time
+    // First crossing — no lap time. El DS-300 real cuenta ESTE cruce en byte12
+    // (=1) igual que PitWall lo cuenta como vuelta 1; el siguiente cruce lleva
+    // byte12=2. (Antes se ponía lapCount=0 y el 1er cruce real reutilizaba
+    // byte12=1, desalineando el contador respecto al hardware real.)
     queueFrame(firstCrossingFrame(lane));
     s.lastCrossingAt = now;
-    s.lapCount       = 0;
+    s.lapCount       = 1;
   } else if (maybeGhostLap(lane, now)) {
-    // El fantasma ya emitió ambas tramas y actualizó estados
+    // Cruce mal atribuido: el fantasma ya emitió su trama corta en el vecino y
+    // este carril (lane) queda con la vuelta PERDIDA (no se toca su estado).
+    // La reprogramación de abajo hace que su próximo cruce real salga ≈doble.
   } else {
     const lapTimeMs = now - s.lastCrossingAt;
     s.lapCount++;
@@ -398,8 +441,11 @@ function doLapCrossing(lane) {
     io.emit('lap', { lane, lapCount: s.lapCount, lapTimeMs });
   }
 
-  // Schedule next crossing
-  const nextLap = randomLapMs(s.avgLapMs);
+  // Schedule next crossing. Degradación: la media crece DEG_MS_PER_LAP por
+  // vuelta del stint (simula goma desgastándose), para validar la estrategia
+  // de neumáticos. DS_DEG_MS_PER_LAP=0 (def.) → sin degradación.
+  const degradedAvg = s.avgLapMs + DEG_MS_PER_LAP * s.lapCount;
+  const nextLap = randomLapMs(degradedAvg);
   s.remainingInLap = nextLap;
   scheduleLap(lane, nextLap);
   emitState();
@@ -527,6 +573,26 @@ function finishRace() {
   if (tickTimer)   { clearInterval(tickTimer);  tickTimer   = null; }
 
   queueFrame(finishFrame());
+
+  // TEST-ONLY (DS_FLAG_LANES): coches que cruzan JUSTO en la bandera. El DS
+  // cuenta la vuelta (byte12++) pero manda el frame del cruce DESPUÉS del A4 de
+  // fin (llega ~160ms después por la cola). Reproduce el bug del "cruce en la
+  // bandera" que el receptor descartaba por circuito ya 'finished'.
+  // Formato: DS_FLAG_LANES="1,3,5" (vacío/ausente = desactivado).
+  const flagLanes = (process.env.DS_FLAG_LANES || '')
+    .split(',').map(s => parseInt(s.trim(), 10))
+    .filter(n => Number.isInteger(n) && n >= 1 && n <= NUM_LANES);
+  for (const lane of flagLanes) {
+    const s = laneState[lane];
+    if (!s || s.lastCrossingAt === null) continue;   // sin vueltas previas: nada que cerrar
+    const lapMs = Math.max(1000, Date.now() - s.lastCrossingAt);
+    s.lapCount++;
+    s.lastLapMs      = lapMs;
+    s.lastCrossingAt = Date.now();
+    queueFrame(lapCrossingFrame(lane, lapMs, s.lapCount));
+    console.log(`[Race] Flag crossing (post-A4) carril ${lane} → lap ${s.lapCount} (${(lapMs/1000).toFixed(2)}s, byte12=${s.lapCount})`);
+  }
+
   console.log('[Race] Finished');
   emitState();
 }
@@ -732,6 +798,7 @@ app.get('/api/status', (req, res) => {
     elapsedMs:   elapsedMs(),
     durationMin: RACE_DURATION_MS / 60000,
     lanes:       NUM_LANES,
+    avgLapMs:    Array.from({ length: NUM_LANES }, (_, i) => laneState[i + 1].avgLapMs),
   });
 });
 
