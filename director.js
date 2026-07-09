@@ -16,6 +16,7 @@
 
 const express = require('express');
 const path    = require('path');
+const fs      = require('fs');
 
 const app  = express();
 const PORT = parseInt(process.env.DS_DIRECTOR_PORT || '3099', 10);
@@ -54,6 +55,19 @@ async function fetchTimeout(url, opts = {}, ms = 1200) {
   }
 }
 
+// Resuelve un symlink a su /dev/ttysNNN real (null si no se puede).
+function realDev(p) {
+  try { return p ? fs.realpathSync(p) : null; } catch { return null; }
+}
+
+// Dado el puerto socat del emulador, deriva el puerto que debe usar SloTime.
+// Convención de nombres del montaje: /tmp/ds300-emuN  ↔  /tmp/ds300-appN.
+function slotimeSideOf(emuPath) {
+  if (!emuPath) return null;
+  const m = emuPath.match(/ds300-emu(\d+)$/);
+  return m ? emuPath.replace(/ds300-emu\d+$/, `ds300-app${m[1]}`) : null;
+}
+
 // Sondea un emulador concreto. Devuelve siempre un objeto (online:false si cae).
 async function probe(httpPort, idx) {
   const url = `http://localhost:${httpPort}`;
@@ -61,11 +75,16 @@ async function probe(httpPort, idx) {
     const r = await fetchTimeout(`${url}/api/status`);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const s = await r.json();
+    const emuPath     = s.port || null;
+    const slotimePath = slotimeSideOf(emuPath);
     return {
       idx, httpPort, url,
       online:      true,
       connected:   !!s.connected,
-      serialPath:  s.port || null,
+      serialPath:  emuPath,                  // socat lado emulador (lo que abrió el emulador)
+      serialReal:  realDev(emuPath),         // /dev/ttysNNN real del lado emulador
+      slotimePath,                           // socat lado SloTime (derivado por convención)
+      slotimeReal: realDev(slotimePath),     // /dev/ttysNNN real del lado SloTime
       state:       s.state || 'idle',
       remainingMs: s.remainingMs || 0,
       durationMin: s.durationMin || null,
@@ -73,6 +92,7 @@ async function probe(httpPort, idx) {
     };
   } catch (e) {
     return { idx, httpPort, url, online: false, connected: false, serialPath: null,
+             serialReal: null, slotimePath: null, slotimeReal: null,
              state: 'offline', remainingMs: 0, durationMin: null, lanes: null };
   }
 }

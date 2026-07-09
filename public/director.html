@@ -70,6 +70,20 @@
   .state-pill.paused   { background: #3a2c08; color: #ca8a04; }
   .state-pill.finished { background: #3a1115; color: #e63946; }
   .state-pill.idle     { background: #21262d; color: #8b949e; }
+  .port-block { margin-top: .55rem; padding-top: .5rem; border-top: 1px solid #21262d; font-size: .72rem; line-height: 1.6; }
+  .port-line { display: flex; align-items: center; gap: .3rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .port-line b { color: #8b949e; font-weight: 600; }
+  .mono { font-family: 'Courier New', monospace; color: #58a6ff; overflow: hidden; text-overflow: ellipsis; }
+  .mono.copy { cursor: pointer; }
+  .mono.copy:hover { text-decoration: underline; }
+  .dim { color: #6e7681; font-family: 'Courier New', monospace; }
+  .arrow { color: #3fb950; font-weight: 700; }
+  .unit__actions { display: flex; gap: .35rem; margin-top: .7rem; }
+  .unit__actions .btn { flex: 1; padding: .35rem 0; font-size: .8rem; }
+  .btn--go-sm     { background: #16a34a; color: #fff; }
+  .btn--pause-sm  { background: #ca8a04; color: #fff; }
+  .btn--resume-sm { background: #2563eb; color: #fff; }
+  .btn--stop-sm   { background: #b91c1c; color: #fff; }
 
   .log {
     background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
@@ -148,6 +162,45 @@ function fmtCountdown(ms) {
 
 const STATE_ES = { idle:'En espera', running:'En carrera', paused:'Pausada', finished:'Finalizada', offline:'Offline' };
 
+// Muestra el puerto socat del emulador y a cuál va asociado en SloTime.
+function portRows(u) {
+  if (!u.connected) {
+    return `<div class="port-block"><div class="port-line"><span class="dot warn"></span><b>socat:</b>&nbsp;sin conectar</div></div>`;
+  }
+  const emuReal = u.serialReal && u.serialReal !== u.serialPath ? ` (${u.serialReal})` : '';
+  let slotimeLine;
+  if (u.slotimePath) {
+    const sltReal = u.slotimeReal ? ` (${u.slotimeReal})` : '';
+    slotimeLine = `<div class="port-line"><span class="arrow">→</span><b>SloTime:</b>
+      <span class="mono copy" data-copy="${u.slotimePath}" title="Clic para copiar">${u.slotimePath}</span><span class="dim">${sltReal}</span></div>`;
+  } else {
+    // El emulador no usa los nombres /tmp/ds300-emuN: no podemos derivar el par.
+    slotimeLine = `<div class="port-line"><span class="arrow">→</span><b>SloTime:</b>&nbsp;<span class="dim">el otro extremo del par socat</span></div>`;
+  }
+  return `<div class="port-block">
+    <div class="port-line"><span class="dot on"></span><b>Emulador:</b>
+      <span class="mono">${u.serialPath}</span><span class="dim">${emuReal}</span></div>
+    ${slotimeLine}
+  </div>`;
+}
+
+// Botonera individual de un circuito (GO / Pausa↔Reanudar / Stop), según su estado.
+function unitActions(u) {
+  const st = u.state;
+  const goDis    = !(st === 'idle' || st === 'finished');
+  const isResume = st === 'paused';
+  const ppAct    = isResume ? 'resume' : 'pause';
+  const ppCls    = isResume ? 'btn--resume-sm' : 'btn--pause-sm';
+  const ppLabel  = isResume ? '▶ Reanudar' : '⏸ Pausa';
+  const ppDis    = !(st === 'running' || st === 'paused');
+  const stopDis  = !(st === 'running' || st === 'paused' || st === 'finished');
+  return `<div class="unit__actions">
+    <button class="btn btn--go-sm"   data-act="go"      data-port="${u.httpPort}" ${goDis?'disabled':''}>▶ GO</button>
+    <button class="btn ${ppCls}"     data-act="${ppAct}" data-port="${u.httpPort}" ${ppDis?'disabled':''}>${ppLabel}</button>
+    <button class="btn btn--stop-sm" data-act="stop"    data-port="${u.httpPort}" ${stopDis?'disabled':''}>⏹ Stop</button>
+  </div>`;
+}
+
 function render() {
   const cont = document.getElementById('units');
   cont.innerHTML = '';
@@ -166,7 +219,8 @@ function render() {
       <div class="unit__timer ${u.online ? u.state : 'idle'}">${u.online && u.state !== 'idle' ? fmtCountdown(u.remainingMs) : '—'}</div>
       <div style="text-align:center;margin-bottom:.4rem"><span class="state-pill ${u.online ? u.state : 'idle'}">${STATE_ES[u.state] || u.state}</span></div>
       <div class="unit__row"><span class="unit__label">Emulador</span><span><span class="dot ${u.online?'on':''}"></span> ${u.online ? 'online' : 'offline'}</span></div>
-      <div class="unit__row"><span class="unit__label">Puerto serie</span><span><span class="dot ${u.connected?'on':'warn'}"></span> ${u.serialPath ? u.serialPath.split('/').pop() : 'sin conectar'}</span></div>
+      ${u.online ? portRows(u) : ''}
+      ${u.online ? unitActions(u) : ''}
     `;
     cont.appendChild(div);
   });
@@ -178,6 +232,19 @@ function render() {
       const port = +cb.dataset.port;
       if (cb.checked) selected.add(port); else selected.delete(port);
       render();
+    });
+  });
+
+  // Botones individuales por circuito
+  cont.querySelectorAll('.unit__actions .btn').forEach(b => {
+    b.addEventListener('click', () => sendControl(b.dataset.act, [+b.dataset.port], `circuito :${b.dataset.port}`));
+  });
+
+  // Clic en el puerto de SloTime → copiar al portapapeles
+  cont.querySelectorAll('.mono.copy').forEach(el => {
+    el.addEventListener('click', () => {
+      const txt = el.dataset.copy;
+      if (navigator.clipboard) navigator.clipboard.writeText(txt).then(() => addLog(`📋 Copiado: ${txt}`, 'info')).catch(() => {});
     });
   });
 
@@ -204,13 +271,14 @@ async function refresh() {
   }
 }
 
-async function control(action) {
-  const ports = units.filter(u => u.online && selected.has(u.httpPort)).map(u => u.httpPort);
+// Envía una acción a una lista concreta de puertos. Lo usan tanto el control
+// de grupo como los botones individuales de cada circuito.
+async function sendControl(action, ports, desc) {
   if (!ports.length) { addLog('No hay circuitos online seleccionados', 'warn'); return; }
   const body = { action, ports };
   if (action === 'go') body.durationMin = parseInt(document.getElementById('durationInput').value, 10) || 5;
   const labels = { go:'GO', pause:'PAUSA', resume:'REANUDAR', stop:'STOP' };
-  addLog(`${labels[action]} → circuitos ${ports.map(p => ':' + p).join(' ')}`, 'info');
+  addLog(`${labels[action]} → ${desc}`, 'info');
   try {
     const r = await fetch('/api/control', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const data = await r.json();
@@ -221,6 +289,12 @@ async function control(action) {
   } catch (e) {
     addLog('Error enviando control: ' + e.message, 'error');
   }
+}
+
+// Control de grupo: actúa sobre los circuitos online marcados.
+function control(action) {
+  const ports = units.filter(u => u.online && selected.has(u.httpPort)).map(u => u.httpPort);
+  sendControl(action, ports, `circuitos ${ports.map(p => ':' + p).join(' ')}`);
 }
 
 document.getElementById('btnGo').addEventListener('click',     () => control('go'));
