@@ -167,6 +167,35 @@ function stopFrame() {
   return buildFrame(0x00, 0xA7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
 }
 
+// ── Latido ────────────────────────────────────────────────────────────────────
+// El DS-300 emite una trama de latido cada 60 s mientras la carrera CORRE, crucen
+// o no coches: [7]=0x00 [8]=0xC0, con B14 = minuto transcurrido. Es la señal con
+// la que PitWall distingue "la caja está viva pero callada" de "la caja se ha
+// muerto". Sin emitirla, el banco no puede probar ese watchdog — y peor: una
+// manga larga sin cruces lo dispararía por un fallo del emulador, no del código.
+const HEARTBEAT_MS = 60000;
+let heartbeatTimer = null;
+let heartbeatMin   = 0;
+
+function heartbeatFrame(minute) {
+  return buildFrame(0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, minute & 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatMin = 0;
+  heartbeatTimer = setInterval(() => {
+    if (raceState !== STATE.RUNNING) return;   // en pausa la caja calla
+    heartbeatMin += 1;
+    queueFrame(heartbeatFrame(heartbeatMin));
+    io.emit('log', `♥ latido (min ${heartbeatMin})`);
+  }, HEARTBEAT_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+
 // ── Serial port & frame queue ─────────────────────────────────────────────────
 
 let serialPort   = null;
@@ -462,6 +491,7 @@ function startRace(durationMin) {
   // El cronómetro real empieza al enviar T3 (A3 = current ON). Hasta entonces
   // raceStartAt = null para que elapsedMs() devuelva 0 durante la cuenta atrás.
   raceStartAt   = null;
+  startHeartbeat();
 
   // Real DS-300 GO sequence: 3 frames at t=0 / +2500ms / +2953ms
   queueFrame(goFrame1());
@@ -565,6 +595,7 @@ function resumeRace() {
 function finishRace() {
   if (raceState === STATE.FINISHED || raceState === STATE.IDLE) return;
   raceState = STATE.FINISHED;
+  stopHeartbeat();
 
   for (let i = 1; i <= NUM_LANES; i++) {
     if (laneState[i].timer) { clearTimeout(laneState[i].timer); laneState[i].timer = null; }
@@ -600,6 +631,7 @@ function finishRace() {
 function stopRace() {
   if (raceState === STATE.IDLE) return;
   raceState = STATE.IDLE;
+  stopHeartbeat();
 
   for (let i = 1; i <= NUM_LANES; i++) {
     if (laneState[i].timer) { clearTimeout(laneState[i].timer); laneState[i].timer = null; }
