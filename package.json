@@ -5,7 +5,8 @@
   "main": "emulator.js",
   "scripts": {
     "start": "node emulator.js",
-    "director": "node director.js"
+    "director": "node director.js",
+    "4port": "node ds4port.js"
   },
   "dependencies": {
     "express": "^4.18.0",

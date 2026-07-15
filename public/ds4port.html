@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DS 4-port · Agrupador de puertos</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0d1117; color: #c9d1d9; min-height: 100vh; padding: 1.5rem;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; color: #e6edf3; letter-spacing: .04em; }
+  .header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
+  .badge {
+    background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+    padding: .25rem .6rem; font-size: .75rem; font-weight: 700; color: #8b949e; letter-spacing: .06em;
+  }
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .card-title { font-size: .7rem; font-weight: 700; color: #8b949e;
+    text-transform: uppercase; letter-spacing: .08em; margin-bottom: .75rem; }
+
+  .btn { padding: .4rem .9rem; border-radius: 6px; border: none;
+    font-size: .82rem; font-weight: 600; cursor: pointer; transition: opacity .15s; }
+  .btn:hover { opacity: .85; } .btn:disabled { opacity: .35; cursor: not-allowed; }
+  .btn--ghost   { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .btn--connect { background: #16a34a; color: #fff; }
+  .btn--dis     { background: #b91c1c; color: #fff; }
+
+  select, input[type=number] {
+    background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+    border-radius: 6px; padding: .35rem .5rem; font-size: .82rem; font-family: inherit;
+  }
+  select { min-width: 190px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #30363d; display: inline-block; }
+  .dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .mono { font-family: 'Courier New', monospace; color: #58a6ff; }
+  .muted { color: #6e7681; font-size: .75rem; }
+
+  /* Diagrama de flujo */
+  .flow { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  .flow .box { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: .6rem .9rem; font-size: .8rem; }
+  .flow .arrow { color: #3fb950; font-weight: 700; font-size: 1.2rem; }
+  .flow .counter { font-family: 'Courier New', monospace; color: #f6c90e; font-weight: 700; }
+
+  /* Slots de entrada */
+  .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: .9rem; }
+  .slot { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: .9rem 1rem; border-left: 4px solid #30363d; transition: border-color .2s; }
+  .slot.on { border-left-color: #3fb950; }
+  .slot__top { display: flex; align-items: center; gap: .55rem; margin-bottom: .7rem; }
+  .slot__name { font-weight: 700; color: #e6edf3; font-size: 1rem; }
+  .slot__stat { margin-left: auto; font-size: .72rem; color: #6e7681; }
+  .slot__row { display: flex; gap: .5rem; align-items: center; margin-bottom: .55rem; flex-wrap: wrap; }
+  .slot__row label { font-size: .72rem; color: #8b949e; }
+  .circuit-in { width: 56px; text-align: center; }
+  .lastframe { font-family: 'Courier New', monospace; font-size: .68rem; color: #8b949e;
+    background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: .4rem .5rem;
+    margin-top: .4rem; overflow-x: auto; white-space: nowrap; }
+  .lastframe .b4 { color: #f6c90e; font-weight: 700; }
+  .lastframe .b1 { color: #58a6ff; font-weight: 700; }
+  .lastframe .type { color: #3fb950; }
+
+  .log { background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: .75rem; height: 200px; overflow-y: auto; font-family: 'Courier New', monospace;
+    font-size: .72rem; color: #8b949e; }
+  .log p { margin: .08rem 0; white-space: nowrap; }
+  .log p.info { color: #3fb950; } .log p.warn { color: #ca8a04; } .log p.error { color: #e63946; }
+  .log p.fr .b4 { color: #f6c90e; font-weight: 700; } .log p.fr .b1 { color: #58a6ff; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🔌 DS 4-port · Agrupador</h1>
+  <span class="badge">PASARELA · 1-4 DS-300 → 1 COM</span>
+  <span class="badge" id="summaryBadge">salida ✗ · 0 entradas · 0 tramas</span>
+  <button class="btn btn--ghost" id="btnRefresh" style="margin-left:auto">↺ Puertos</button>
+  <button class="btn btn--ghost" id="btnReset">⟲ Reiniciar contador</button>
+</div>
+
+<!-- Flujo -->
+<div class="card">
+  <div class="card-title">Flujo</div>
+  <div class="flow">
+    <div class="box">Entradas: <b id="flowIn">0/4</b> DS-300</div>
+    <span class="arrow">→</span>
+    <div class="box">byte[1]=contador global <span class="counter" id="flowCounter">0x00</span><br>
+      <span class="muted">byte[4]=circuito · checksum recalculado</span></div>
+    <span class="arrow">→</span>
+    <div class="box">Salida: <span id="flowOut" class="mono">—</span><br>
+      <span class="muted"><span id="flowTotal">0</span> tramas reenviadas</span></div>
+  </div>
+</div>
+
+<!-- Salida -->
+<div class="card">
+  <div class="card-title">Puerto de salida (al PC / PitWall)</div>
+  <div class="slot__row">
+    <span class="dot" id="outDot"></span>
+    <select id="outSelect"></select>
+    <button class="btn btn--connect" id="outConnect">Conectar salida</button>
+    <button class="btn btn--dis" id="outDisconnect" disabled>Desconectar</button>
+    <span class="muted" id="outInfo">sin conectar</span>
+  </div>
+</div>
+
+<!-- Entradas -->
+<div class="card">
+  <div class="card-title">Entradas (DS-300)</div>
+  <div class="slots" id="slots"></div>
+</div>
+
+<!-- Log -->
+<div class="card">
+  <div class="card-title">Tramas reenviadas (en vivo)</div>
+  <div class="log" id="log"></div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket = io();
+let ports = [];
+let status = null;
+
+function addLog(text, cls = '', html = false) {
+  const log = document.getElementById('log');
+  const p = document.createElement('p');
+  if (cls) p.className = cls;
+  const t = `[${new Date().toTimeString().slice(0,8)}] `;
+  if (html) p.innerHTML = t + text; else p.textContent = t + text;
+  log.appendChild(p);
+  log.scrollTop = log.scrollHeight;
+  while (log.childNodes.length > 250) log.removeChild(log.firstChild);
+}
+
+// Pinta una trama hex resaltando byte[1] (contador) y byte[4] (circuito).
+function hilite(hexStr) {
+  const b = hexStr.split(' ');
+  if (b.length < 21) return hexStr;
+  b[1] = `<span class="b1">${b[1]}</span>`;
+  b[4] = `<span class="b4">${b[4]}</span>`;
+  return b.join(' ');
+}
+
+function fillSelect(sel, current) {
+  const prev = current || sel.value;
+  sel.innerHTML = '<option value="">— elige puerto —</option>' +
+    ports.map(p => `<option value="${p}">${p}</option>`).join('');
+  if (prev && ports.includes(prev)) sel.value = prev;
+}
+
+function renderSlots() {
+  const cont = document.getElementById('slots');
+  if (!cont.dataset.built) {
+    cont.innerHTML = '';
+    for (let i = 1; i <= 4; i++) {
+      const div = document.createElement('div');
+      div.className = 'slot'; div.id = `slot${i}`;
+      div.innerHTML = `
+        <div class="slot__top">
+          <span class="dot" id="dot${i}"></span>
+          <span class="slot__name">Entrada ${i}</span>
+          <span class="slot__stat" id="stat${i}">0 tramas</span>
+        </div>
+        <div class="slot__row">
+          <select id="sel${i}"></select>
+        </div>
+        <div class="slot__row">
+          <label>byte[4] (circuito):</label>
+          <input type="number" class="circuit-in" id="circ${i}" min="0" max="255" value="${i}">
+          <button class="btn btn--connect" id="con${i}">Conectar</button>
+          <button class="btn btn--dis" id="dis${i}" disabled>Desconectar</button>
+        </div>
+        <div class="lastframe" id="last${i}">— sin tramas —</div>`;
+      cont.appendChild(div);
+    }
+    cont.dataset.built = '1';
+    for (let i = 1; i <= 4; i++) {
+      document.getElementById(`con${i}`).addEventListener('click', () => {
+        const path = document.getElementById(`sel${i}`).value;
+        const circuitId = parseInt(document.getElementById(`circ${i}`).value, 10);
+        if (!path) return addLog(`Entrada ${i}: elige un puerto`, 'warn');
+        socket.emit('set_circuit', { slot: i, circuitId });
+        socket.emit('connect_input', { slot: i, path });
+      });
+      document.getElementById(`dis${i}`).addEventListener('click', () => socket.emit('disconnect_input', { slot: i }));
+      document.getElementById(`circ${i}`).addEventListener('change', () => {
+        socket.emit('set_circuit', { slot: i, circuitId: parseInt(document.getElementById(`circ${i}`).value, 10) });
+      });
+    }
+  }
+  for (let i = 1; i <= 4; i++) fillSelect(document.getElementById(`sel${i}`));
+}
+
+function applyStatus(s) {
+  status = s;
+  // Salida
+  const outDot = document.getElementById('outDot');
+  outDot.className = 'dot' + (s.output.connected ? ' on' : '');
+  document.getElementById('outConnect').disabled = s.output.connected;
+  document.getElementById('outDisconnect').disabled = !s.output.connected;
+  document.getElementById('outInfo').textContent = s.output.connected ? `conectado · ${s.output.path}` : 'sin conectar';
+  document.getElementById('flowOut').textContent = s.output.connected ? s.output.path : '—';
+  document.getElementById('flowTotal').textContent = s.totalForwarded;
+  document.getElementById('flowCounter').textContent = '0x' + s.globalCounter.toString(16).toUpperCase().padStart(2, '0');
+
+  let connected = 0;
+  s.slots.forEach(sl => {
+    if (sl.connected) connected++;
+    const slotEl = document.getElementById(`slot${sl.idx}`);
+    if (slotEl) slotEl.className = 'slot' + (sl.connected ? ' on' : '');
+    const dot = document.getElementById(`dot${sl.idx}`);
+    if (dot) dot.className = 'dot' + (sl.connected ? ' on' : '');
+    const con = document.getElementById(`con${sl.idx}`), dis = document.getElementById(`dis${sl.idx}`);
+    if (con) con.disabled = sl.connected;
+    if (dis) dis.disabled = !sl.connected;
+    const circ = document.getElementById(`circ${sl.idx}`);
+    if (circ && document.activeElement !== circ) circ.value = sl.circuitId;
+    const stat = document.getElementById(`stat${sl.idx}`);
+    if (stat) stat.textContent = `${sl.frameCount} tramas${sl.dropped ? ' · ' + sl.dropped + 'B desc.' : ''}`;
+    const last = document.getElementById(`last${sl.idx}`);
+    if (last) last.innerHTML = sl.lastHex
+      ? `<span class="type">${sl.lastType}</span>  ${hilite(sl.lastHex)}`
+      : '— sin tramas —';
+    if (sl.connected && circ && document.activeElement !== circ) {
+      const sel = document.getElementById(`sel${sl.idx}`);
+      if (sel && sl.path && ports.includes(sl.path)) sel.value = sl.path;
+    }
+  });
+
+  document.getElementById('flowIn').textContent = `${connected}/4`;
+  document.getElementById('summaryBadge').textContent =
+    `salida ${s.output.connected ? '✓' : '✗'} · ${connected} entradas · ${s.totalForwarded} tramas`;
+}
+
+socket.on('ports', p => { ports = p; renderSlots(); fillSelect(document.getElementById('outSelect'), status?.output?.path); if (status) applyStatus(status); });
+socket.on('status', applyStatus);
+socket.on('log', (msg, cls) => addLog(msg, cls || ''));
+socket.on('frame', f => {
+  addLog(`IN${f.slot}(c${f.circuitId}) ${f.type.padEnd(12)} → ${hilite(f.hexOut)}`, 'fr', true);
+});
+
+document.getElementById('outConnect').addEventListener('click', () => {
+  const path = document.getElementById('outSelect').value;
+  if (!path) return addLog('Salida: elige un puerto', 'warn');
+  socket.emit('connect_output', { path });
+});
+document.getElementById('outDisconnect').addEventListener('click', () => socket.emit('disconnect_output'));
+document.getElementById('btnRefresh').addEventListener('click', () => socket.emit('list_ports'));
+document.getElementById('btnReset').addEventListener('click', () => socket.emit('reset_counter'));
+
+renderSlots();
+addLog('Agrupador DS 4-port listo', 'info');
+</script>
+</body>
+</html>

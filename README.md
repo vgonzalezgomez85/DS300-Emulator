@@ -83,6 +83,71 @@ El director **no emula nada**: solo orquesta por HTTP los emuladores ya vivos
 
 ---
 
+## DS 4-port (agrupador de puertos)
+
+El **DS 4-port** es el aparato físico que une de **1 a 4 DS-300** (cada uno en su
+COM) y vuelca **todo por un único COM** hacia el PC con el software. `ds4port.js`
+lo emula como **pasarela pura**: NO simula carreras, sino que abre hasta 4 puertos
+serie de **entrada** (donde enchufas los DS-300 reales, o los pares socat de
+instancias de `emulator.js`) y un puerto de **salida**, reetiquetando cada trama.
+
+```
+DS real/emu 1 ─COM─┐
+DS real/emu 2 ─COM─┤
+DS real/emu 3 ─COM─┼─[ DS4PORT ]─COM─→ PitWall
+DS real/emu 4 ─COM─┘   reetiqueta
+```
+
+### Qué reescribe (verificado byte a byte contra captura real)
+
+Un DS-300 suelto manda `E0 CC 15 03 00 04 4C …` (byte[4]=`00`, contador propio).
+En el stream fusionado el agrupador reescribe:
+
+| Byte | Antes | Después | Significado |
+|-----:|-------|---------|-------------|
+| 1  | contador propio del DS | **contador GLOBAL único** | rolling `00-FF`, +1 por trama sea del puerto que sea |
+| 4  | `00` | **nº de circuito de origen** (`01`-`04`) | así el software identifica el circuito |
+| 18 | checksum del DS | **checksum recalculado** | `(B1+…+B17) mod 256` tras estampar 1 y 4 |
+
+El resto (tipo, subtipo, tiempos BCD, máscara de carril, byte 19, `0xEB`) se pasa intacto.
+
+### Uso
+
+```bash
+# 1. Un par socat por cada entrada + uno para la salida:
+socat -d -d pty,raw,echo=0,link=/tmp/ds300-emu1 pty,raw,echo=0,link=/tmp/ds300-app1   # …emu2/app2, emu3/app3, emu4/app4
+socat -d -d pty,raw,echo=0,link=/tmp/ds4-out    pty,raw,echo=0,link=/tmp/ds4-app
+
+# 2. Cada DS-300 (o emulator.js) escribe en su lado -emuN.
+# 3. Arranca el agrupador (UI en http://localhost:3200):
+npm run 4port
+```
+
+En la UI: conecta la **salida** a `/tmp/ds4-out`, y cada **entrada** a `/tmp/ds300-appN`
+(ajustando el `byte[4]` de circuito por entrada). Apunta PitWall a `/tmp/ds4-app`.
+
+### Variables de entorno (auto-conexión)
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `DS4_HTTP_PORT` | `3200` | Puerto HTTP de la UI |
+| `DS4_OUT` | — | Puerto de salida a auto-conectar al arrancar |
+| `DS4_IN1`…`DS4_IN4` | — | Puerto de entrada por slot (circuito 1-4) a auto-conectar |
+| `DS4_BAUD_IN` / `DS4_BAUD_OUT` | `56000` | Baudios entrada / salida (fallback 57600) |
+
+### API HTTP
+
+| Endpoint | Método | Acción |
+|----------|--------|--------|
+| `/api/status` | GET | Estado: salida, contador global, total reenviadas, slots |
+| `/api/ports` | GET | Lista de puertos serie disponibles |
+| `/api/output` | POST | Conectar salida: `{ path, baud? }` |
+| `/api/input` | POST | Conectar entrada: `{ slot, path, circuitId?, baud? }` |
+
+Mismas acciones vía Socket.IO desde la UI.
+
+---
+
 ## Protocolo implementado
 
 ### Estructura de trama (21 bytes)
@@ -148,7 +213,11 @@ Mismas acciones disponibles vía Socket.IO desde la UI.
 ## Estructura
 
 ```
-emulator.js       — servidor + lógica de carrera + emisión de tramas
-connect.js        — helper para gestión del SerialPort
-public/index.html — UI web (controles + log en vivo)
+emulator.js         — servidor + lógica de carrera + emisión de tramas (1 DS-300)
+director.js         — panel maestro multi-DS (orquesta N emuladores por HTTP)
+ds4port.js          — agrupador de puertos: 1-4 DS-300 → 1 COM (pasarela pura)
+connect.js          — helper para gestión del SerialPort
+public/index.html   — UI del emulador (controles + log en vivo)
+public/director.html— UI del director de carrera
+public/ds4port.html — UI del agrupador DS 4-port
 ```

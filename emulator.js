@@ -16,6 +16,11 @@ const PORT     = parseInt(process.env.DS_HTTP_PORT || '3100', 10);
 const DEFAULT_DURATION_MIN = parseInt(process.env.DS_DURATION_MIN || '5', 10);
 let RACE_DURATION_MS = DEFAULT_DURATION_MIN * 60 * 1000;
 const NUM_LANES        = parseInt(process.env.DS_LANES || '8', 10);
+// Id de caja del AGRUPADOR (byte[4]). Un DS-300 suelto lleva 0x00 ahí; el aparato
+// que agrupa varias cajas en un puerto sobrescribe ese byte con el nº de caja
+// (0x01, 0x02, 0x03, 0x04). Poniendo DS_BOX_ID=2 este emulador imita la caja 2 de
+// un agrupador, y PitWall (modo "DS-300 agrupador") mapea sus carriles al 9–16.
+const BOX_ID           = parseInt(process.env.DS_BOX_ID || '0', 10) & 0xFF;
 // Media de vuelta fija para todos los carriles (ms). Si no se define DS_AVG_MS,
 // se usa la media aleatoria por carril de siempre (9-12s).
 const AVG_LAP_MS       = process.env.DS_AVG_MS ? parseInt(process.env.DS_AVG_MS, 10) : null;
@@ -90,9 +95,11 @@ function computeChecksum(b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13,
 
 function buildFrame(b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, _b18Ignored, b19, overrideCounter) {
   const cnt = overrideCounter !== undefined ? overrideCounter : nextCounter();
-  const b18 = computeChecksum(cnt, 0x15, 0x03, 0x00, 0x04, 0x4C, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17);
+  // byte[4] = BOX_ID (0 = DS suelto; 1..4 = caja del agrupador). El checksum lo
+  // incluye para casar con el hardware real (aunque PitWall no lo verifique).
+  const b18 = computeChecksum(cnt, 0x15, 0x03, BOX_ID, 0x04, 0x4C, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17);
   return Buffer.from([
-    0xE0, cnt, 0x15, 0x03, 0x00, 0x04, 0x4C,
+    0xE0, cnt, 0x15, 0x03, BOX_ID, 0x04, 0x4C,
     b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
     0xEB
   ]);
