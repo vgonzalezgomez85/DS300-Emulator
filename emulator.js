@@ -399,7 +399,7 @@ function scheduleLap(lane, delayMs) {
 // coches cerca de la línea): por eso exigimos que G sea adyacente y que su hueco
 // caiga en [GHOST_MIN_MS, GHOST_MAX_MS] — así el tiempo corto es realista Y
 // consistente con el reloj (no un valor inventado).
-const GHOST_PROB   = parseFloat(process.env.DS_GHOST_PROB || '0.03'); // prob. por oportunidad (vecino recién cruzado)
+const GHOST_PROB   = parseFloat(process.env.DS_GHOST_PROB || '0'); // prob. por oportunidad (vecino recién cruzado); 0 = desactivado, activar con DS_GHOST_PROB
 const GHOST_MIN_MS = parseInt(process.env.DS_GHOST_MIN_MS || '700', 10);  // > MIN_CROSSING_MS(500) de PitWall: debe PASAR el filtro
 const GHOST_MAX_MS = parseInt(process.env.DS_GHOST_MAX_MS || '3500', 10); // techo del cruce corto observado en real
 
@@ -582,10 +582,19 @@ function resumeRace() {
     totalPausedMs += pausedDuration;
     raceState = STATE.RUNNING;
 
-    // Ajusta lastCrossingAt por toda la pausa (incluyendo los ~3s de secuencia)
+    // NO se toca lastCrossingAt: el DS-300 real sigue contando durante la
+    // pausa (así lo asume TimingService._onCrossing, que resta pausedMs del
+    // PRIMER lap_time_ms tras cada resume — ver pendingPauseAdjustMs en
+    // TimingService.js). Si aquí además desplazáramos lastCrossingAt, el
+    // hueco de pausa quedaría restado DOS VECES: el emulador ya lo excluiría
+    // del lap_time_ms reportado, y PitWall lo volvería a restar encima →
+    // vueltas post-resume con tiempo negativo/ínfimo, descartadas como
+    // fantasma (visto en real: 24 "Ghost lap" seguidas nada más reanudar).
+    // Al dejar lastCrossingAt intacto, el próximo cruce reporta
+    // (vuelta_real + pausedDuration), que es justo lo que la resta de
+    // PitWall espera deshacer.
     for (let i = 1; i <= NUM_LANES; i++) {
       const s = laneState[i];
-      if (s.lastCrossingAt) s.lastCrossingAt += pausedDuration;
       if (s.remainingInLap != null) scheduleLap(i, s.remainingInLap);
     }
 
