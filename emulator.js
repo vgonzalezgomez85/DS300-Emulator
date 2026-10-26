@@ -128,17 +128,27 @@ function goFrame3() {
 const GO_T2_DELAY_MS = 2500;
 const GO_T3_DELAY_MS = 2953;
 
-// First crossing: byte[14]=0xAA marks invalid time; [12] holds the lap counter (=1)
+// byte[8]=0xA9 NO es "primer cruce del carril": en la captura real lo lleva solo
+// el PRIMER coche que alcanza un nº de vuelta nuevo (el líder); el resto de
+// carriles que cierran esa misma vuelta van con 0x00. Se reinicia en cada GO.
+let leaderLap = 0;
+
+function crossingSubtype(lapNum) {
+  if (lapNum > leaderLap) { leaderLap = lapNum; return 0xA9; }
+  return 0x00;
+}
+
+// First crossing: tiempo inválido AA AB AA AA (como el hardware real); [12] = 1
 function firstCrossingFrame(lane) {
   const lb = LANE_MASK[lane - 1];
-  return buildFrame(0x1B, 0xA9, 0x00, lb, 0x00, 0x01, 0x00, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00);
+  return buildFrame(0x1B, crossingSubtype(1), 0x00, lb, 0x00, 0x01, 0x00, 0xAA, 0xAB, 0xAA, 0xAA, 0x00, 0x00);
 }
 
 // Normal lap crossing: BCD lap time in [14..17], lap counter in [12]
 function lapCrossingFrame(lane, lapTimeMs, lapNum) {
   const lb = LANE_MASK[lane - 1];
   const [m, s, c, d] = encodeLapTime(lapTimeMs);
-  return buildFrame(0x1B, 0x00, 0x00, lb, 0x00, bcd(lapNum % 100), 0x00, m, s, c, d, 0x00, 0x00, 0x00);
+  return buildFrame(0x1B, crossingSubtype(lapNum), 0x00, lb, 0x00, bcd(lapNum % 100), 0x00, m, s, c, d, 0x00, 0x00);
 }
 
 // Pause: B7=0x00 (control), B8=0xA5 (per DS-300 protocol).
@@ -227,6 +237,7 @@ function drainQueue() {
   }
   const buf = frameQueue.shift();
   console.log(`[Drain] Escribiendo frame (byte[7]=${buf[7]?.toString(16)}, byte[8]=${buf[8]?.toString(16)}), ${frameQueue.length} restantes en cola`);
+  console.log(`[TX] ${buf.toString('hex').toUpperCase().match(/../g).join(' ')}`);
   serialPort.write(buf, err => {
     if (err) console.error('[Serial] Write error:', err.message);
   });
@@ -253,6 +264,10 @@ async function connectPort(portPath, baudRate = 56000) {
       serialPort.on('error', e => {
         console.error('[Serial] Port error:', e.message);
         io.emit('port_error', e.message);
+      });
+      // Lo que el receptor (TicTac/PitWall) manda de vuelta al DS
+      serialPort.on('data', d => {
+        console.log(`[RX] ${d.toString('hex').toUpperCase().match(/../g).join(' ')}`);
       });
       console.log(`[Serial] Connected to ${portPath} @ ${rate} baud`);
       return;
@@ -308,6 +323,7 @@ for (let i = 1; i <= NUM_LANES; i++) {
 }
 
 function resetLanes() {
+  leaderLap = 0;
   for (let i = 1; i <= NUM_LANES; i++) {
     if (laneState[i].timer) clearTimeout(laneState[i].timer);
     laneState[i].lapCount       = 0;
