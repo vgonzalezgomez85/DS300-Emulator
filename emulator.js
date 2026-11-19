@@ -308,6 +308,7 @@ let pauseStartAt   = null;   // Date.now() when paused
 let totalPausedMs  = 0;      // accumulated pause time
 let finishTimer    = null;
 let tickTimer      = null;
+let goGen          = 0;      // invalida las tramas T2/T3 de un GO parado durante la cuenta atrás
 
 // Per-lane state
 const laneState = {};
@@ -515,11 +516,14 @@ function startRace(durationMin) {
   // raceStartAt = null para que elapsedMs() devuelva 0 durante la cuenta atrás.
   raceStartAt   = null;
   startHeartbeat();
+  const gen = ++goGen;
+  const live = () => gen === goGen && raceState === STATE.RUNNING;
 
   // Real DS-300 GO sequence: 3 frames at t=0 / +2500ms / +2953ms
   queueFrame(goFrame1());
-  setTimeout(() => queueFrame(goFrame2()), GO_T2_DELAY_MS);
+  setTimeout(() => { if (live()) queueFrame(goFrame2()); }, GO_T2_DELAY_MS);
   setTimeout(() => {
+    if (!live()) return;
     queueFrame(goFrame3());
     // T3 enviada: ahora arranca la carrera de verdad
     raceStartAt = Date.now();
@@ -661,7 +665,14 @@ function finishRace() {
 }
 
 function stopRace() {
-  if (raceState === STATE.IDLE) return;
+  goGen++;
+  if (raceState === STATE.IDLE) {
+    // Como el botón STOP del DS: la trama sale igual, para sacar del «en marcha»
+    // a un receptor que se quedó desincronizado.
+    queueFrame(stopFrame());
+    console.log('[Race] Stop en reposo — trama de stop enviada');
+    return;
+  }
   raceState = STATE.IDLE;
   stopHeartbeat();
 
